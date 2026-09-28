@@ -1,10 +1,8 @@
-# Cat printer Bluetooth protocol
-
-> The `51 78` BLE protocol used by many 384-dot mini thermal printers
+# Cat printer protocol reference
 
 ## Purpose
 
-This document is a reference for the `51 78` protocol and the printer behavior.
+This reference describes Bluetooth messages and observed firmware behavior for cat printers. It covers the common `51 78` family and the MXW01 `22 21` family.
 
 This is not a vendor specification. "Cat printer" is a product category, not one hardware model. Identical names and cases can contain incompatible electronics.
 
@@ -210,7 +208,7 @@ for b in payload:
 return r
 ```
 
-The frame stores this remainder after the payload. The header, length, and terminator do not enter the calculation. Processing `payload || crc` gives remainder zero.
+The frame stores the checksum after the payload. The header, length, and terminator do not enter the calculation. Processing `payload || crc` gives remainder zero.
 
 Test vectors are `00 → 00`, `01 → 07`, `32 → 9E`, and `30 00 → F9`. Example: `51 78 A4 00 01 00 32 9E FF`. \[[rbaron commands][rbaron-cmds]\]
 
@@ -667,7 +665,7 @@ The cause and exact scope of the `AE30` or `AF30` difference remain unknown.
 
 The model-specific `A4` mapping and the feed position relative to lattice end remain unresolved.
 
-`AF` byte order is settled for the common family, but the maximum safe energy per model is not. Whether any common-family command clears the print buffer is also unknown, as is any per-job row limit or the size of the printer's internal buffer.
+`AF` byte order is settled for the common family, but the maximum safe energy per model remains unknown. No common-family command to clear the print buffer is established. The printer's buffer size and any firmware limit on rows per job also remain unknown.
 
 Setup order, feed placement, compression support, state bits, and safe operating ranges remain firmware-dependent.
 

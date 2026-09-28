@@ -53,7 +53,8 @@ mod mxw01;
 
 use crate::session::Operation;
 use crate::{
-    Completion, DeviceInfo, PixelFormat, PrinterStatus, Raster, Result, Transport, error::invalid,
+    Completion, DeviceInfo, PixelFormat, PrinterState, PrinterStatus, Raster, Result, Transport,
+    error::invalid,
 };
 use framing::{Decoder, EncodedCommand, Frame};
 use std::time::Duration;
@@ -217,6 +218,9 @@ pub(crate) trait Operations: Sized + Send + Sync {
     where
         Self: Driver;
     fn observe(&self, frame: &Frame) -> Result<Observation>;
+    fn blocks_submission(&self, _frame: &Frame, state: &PrinterState) -> bool {
+        state.blocks_submission()
+    }
     fn movement(&self, _rows: u16, _retract: bool) -> Result<Movement> {
         Err(invalid(
             "This driver does not support standalone paper movement.",

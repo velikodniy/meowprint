@@ -199,7 +199,9 @@ impl<T: Transport, D: Driver> Operation<'_, T, D> {
             if let Some(status) = &observation.status {
                 self.session.status = Some(status.clone());
                 self.status_seen = true;
-                if self.kind == OperationKind::Submit && status.state.blocks_submission() {
+                if self.kind == OperationKind::Submit
+                    && self.driver.blocks_submission(&frame, &status.state)
+                {
                     failure.get_or_insert_with(|| Error::PrinterUnavailable(status.state.clone()));
                 }
             }
@@ -560,15 +562,78 @@ mod tests {
         }
         Ok(frame)
     }
-    async fn print(printer: &mut Printer<Script, Gt01>) -> Result<crate::PrintReport> {
+    async fn print<D: crate::Driver>(
+        printer: &mut Printer<Script, D>,
+    ) -> Result<crate::PrintReport> {
         printer
-            .prepare(
-                vec![0x81; 48],
-                PixelFormat::Mono,
-                &crate::Gt01Options::default(),
-            )?
+            .prepare(vec![0x81; 48], PixelFormat::Mono, &D::Options::default())?
             .print()
             .await
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn mx10_opaque_a3_replies_allow_printing_without_confirming_completion() -> Result<()> {
+        // Captured from an MX10 during a status query. Its fields are
+        // undocumented; in particular, the trailing 0x2d has no known units.
+        let reply = common(0xa3, &[0, 0, 0x2d])?;
+        let mut baseline = Printer::new(Script::default(), crate::Mx10);
+        let expected = print(&mut baseline).await?;
+        let last = baseline.session.transport.attempts;
+
+        let mut transport = Script::default();
+        transport.reply(1, &reply);
+        transport.reply(last, &reply);
+        let mut printer = Printer::new(transport, crate::Mx10);
+        let report = print(&mut printer).await?;
+        assert_eq!(report.completion, crate::Completion::TimedDrain);
+        assert_eq!(report.bytes_submitted, expected.bytes_submitted);
+        assert_eq!(
+            printer.session.transport.writes,
+            baseline.session.transport.writes
+        );
+        assert!(printer.is_usable());
+        assert_eq!(printer.session.transport.disconnects, 0);
+
+        printer.session.transport.reply(last + 1, &reply);
+        assert_eq!(printer.status().await?.state, PrinterState::Unknown);
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn opaque_a3_cannot_hide_faults_or_resume_a_paused_printer() -> Result<()> {
+        let reply = common(0xa3, &[0, 0, 0x2d])?;
+        for notification in [
+            [reply.as_slice(), AE_PAPER].concat(),
+            [AE_PAPER, reply.as_slice()].concat(),
+            common(0xae, &[0, 0, 0x2d])?,
+        ] {
+            let mut transport = Script::default();
+            transport.reply(1, &notification);
+            let mut printer = Printer::new(transport, crate::Mx10);
+            assert!(matches!(
+                print(&mut printer).await,
+                Err(Error::PrinterUnavailable(_))
+            ));
+            assert_eq!(printer.session.transport.attempts, 1);
+            assert!(!printer.is_usable());
+        }
+
+        let mut transport = Script::default();
+        transport.notify(Duration::ZERO, AE_PAUSE);
+        transport.notify(Duration::from_secs(1), &reply);
+        let mut printer = Printer::new(transport, crate::Mx10);
+        let started = tokio::time::Instant::now();
+        assert!(matches!(
+            print(&mut printer).await,
+            Err(Error::Timeout("printer pause"))
+        ));
+        assert_eq!(
+            tokio::time::Instant::now() - started,
+            Duration::from_secs(15)
+        );
+        assert_eq!(printer.session.transport.attempts, 0);
+        assert!(!printer.is_usable());
+        Ok(())
     }
 
     #[tokio::test(start_paused = true)]

@@ -474,6 +474,12 @@ macro_rules! driver {
                 device_info(&operation.exchange(&command, ReplyKind::Command(command.command), REPLY_TIMEOUT, &mut 0).await?.frame)
             }
             fn observe(&self, frame: &Frame) -> Result<Observation> { observe(frame) }
+            fn blocks_submission(&self, frame: &Frame, state: &PrinterState) -> bool {
+                // A3 reply formats vary by firmware. Only recognized A3 faults block
+                // submission; unknown A3 replies provide no evidence of readiness.
+                state.blocks_submission()
+                    && !(frame.command == 0xa3 && *state == PrinterState::Unknown)
+            }
             fn movement(&self, rows: u16, retract: bool) -> Result<Movement> { ($spec).movement(rows, retract) }
         }
     };

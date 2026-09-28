@@ -1,0 +1,23 @@
+default_stages: [pre-commit]
+
+repos:
+  - repo: builtin
+    hooks:
+      - id: trailing-whitespace
+        args: [--markdown-linebreak-ext=md]
+        # Preserve the upstream font license verbatim.
+        exclude: '^crates/meowprint-cli/assets/fonts/LICENSE-Roboto\.txt$'
+      - id: end-of-file-fixer
+      - id: check-toml
+      - id: check-yaml
+      - id: check-merge-conflict
+      - id: detect-private-key
+      - id: check-added-large-files
+      - id: check-case-conflict
+      - id: check-symlinks
+
+  - repo: https://github.com/doublify/pre-commit-rust
+    rev: v1.0
+    hooks:
+    -   id: fmt
+    -   id: cargo-check

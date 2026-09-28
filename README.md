@@ -37,3 +37,20 @@ meowprint print --device MX10 --driver mx10 text 'Hello from Meowprint!'
 
 See the [command-line guide](crates/meowprint-cli/README.md) for more examples and the [API documentation](https://docs.rs/meowprint) for library use.
 The [protocol reference](crates/meowprint/docs/protocol.md) describes firmware behavior and compatibility.
+
+## Development
+
+Install [prek](https://prek.j178.dev/installation/) and the Rust components used by the hooks:
+
+```sh
+rustup component add rustfmt clippy
+prek install
+```
+
+The hooks run Rust formatting, Clippy, `cargo check`, and common file checks before each commit.
+Rust checks run when source files, manifests, or crate assets change.
+Run all hooks manually with:
+
+```sh
+prek run --all-files
+```

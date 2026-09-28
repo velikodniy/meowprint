@@ -1,0 +1,48 @@
+[package]
+name = "meowprint"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Rust library for printing on Bluetooth cat printers"
+readme = "README.md"
+documentation = "https://docs.rs/meowprint"
+keywords = ["bluetooth", "thermal", "printer", "raster", "ble"]
+categories = ["hardware-support", "encoding"]
+include = ["src/**", "examples/**", "tests/**", "docs/protocol.md", "README.md", "LICENSE", "Cargo.toml", "Cargo.lock"]
+
+[lints]
+workspace = true
+
+[features]
+default = ["bluetooth"]
+bluetooth = ["dep:btleplug", "dep:futures-util", "dep:uuid"]
+image = ["dep:image"]
+
+[[example]]
+name = "bluetooth"
+required-features = ["bluetooth"]
+
+[[example]]
+name = "query"
+required-features = ["bluetooth"]
+
+[[example]]
+name = "preview"
+required-features = ["image"]
+
+[dependencies]
+async-trait = "0.1"
+btleplug = { version = "0.13.2", optional = true }
+flate2 = "1"
+futures-util = { version = "0.3", optional = true }
+image = { version = "0.25", default-features = false, optional = true }
+lzokay-native = "0.1"
+thiserror = "2"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"] }
+uuid = { version = "1", optional = true }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["test-util"] }
+lzokay = "2"

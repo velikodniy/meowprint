@@ -5,7 +5,6 @@
 mod args;
 mod content;
 mod error;
-mod preview;
 mod query_output;
 mod render;
 mod session;
@@ -50,19 +49,18 @@ async fn print<D: CliDriver>(
 ) -> CliResult<()> {
     let started = std::time::Instant::now();
     let options = D::options(controls)?;
-    let format = content.format();
-    driver.validate(&options, format)?;
     eprintln!("Rendering...");
-    let image = content.render(driver)?;
+    let content = content.render(driver, options)?;
+    let (width, height) = content.dimensions();
     eprintln!(
         "Rendered {} x {} dots in {:.2}s.",
-        image.width(),
-        image.height(),
+        width,
+        height,
         started.elapsed().as_secs_f64()
     );
     let printer = connect(&connection, driver).await?;
     let report = session::Session::new(printer, tokio::signal::ctrl_c())
-        .print(image, format, options, preview)
+        .print(content, preview)
         .await?;
     println!(
         "Submitted {} image rows ({} bytes) in {:.2}s. Completion evidence: {:?}. Physical output is not confirmed.",
@@ -154,11 +152,10 @@ async fn execute<D: CliDriver>(command: Command, driver: D) -> CliResult<()> {
         Command::Preview {
             output, content, ..
         } => {
-            let format = content.format();
-            driver.validate(&Default::default(), format)?;
-            let image = content.render(driver)?;
-            let (width, height) = image.dimensions();
-            preview::render(driver, image, format)?
+            let content = content.render(driver, Default::default())?;
+            let (width, height) = content.dimensions();
+            content
+                .preview()?
                 .save_with_format(&output, image::ImageFormat::Png)?;
             println!("Saved {} ({} x {} dots).", output.display(), width, height);
         }

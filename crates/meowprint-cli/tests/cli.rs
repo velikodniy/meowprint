@@ -178,6 +178,24 @@ fn unsupported_configuration_fails_before_bluetooth_discovery()
         assert!(!error.contains("Finding printer"), "{error}");
         assert!(error.contains(expected), "{error}");
     }
+    for command in ["print", "preview"] {
+        let mut cli = miao();
+        cli.args([command, "--driver", "gt01"]);
+        if command == "print" {
+            cli.args(["--device", "not-a-printer"]);
+        } else {
+            cli.args(["--output", "unused.png"]);
+        }
+        let result = cli.args(["image", "missing.png", "--grayscale"]).output()?;
+        assert!(!result.status.success());
+        let error = String::from_utf8_lossy(&result.stderr);
+        assert!(
+            error.contains("does not support four-bit grayscale"),
+            "{error}"
+        );
+        assert!(!error.contains("Cannot open"), "{error}");
+        assert!(!error.contains("Finding printer"), "{error}");
+    }
     Ok(())
 }
 

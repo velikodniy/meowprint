@@ -1,9 +1,8 @@
 //! Connected command operations, cancellation, and printer session cleanup.
 
-use crate::{args::QueryArg, query_output, render};
+use crate::{args::QueryArg, content::RenderedContent, query_output};
 use anyhow::{Context, Result};
-use image::GrayImage;
-use meowprint::{Driver, PixelFormat, PrintReport, Printer, Transport};
+use meowprint::{Driver, PrintReport, Printer, Transport};
 use std::{io, path::PathBuf};
 
 /// Own a connected printer session and its source of cancellation.
@@ -21,14 +20,12 @@ impl<T: Transport, D: Driver, S: Future<Output = io::Result<()>>> Session<T, D, 
     /// Prepare and submit a print job, then close the printer session.
     pub async fn print(
         self,
-        image: GrayImage,
-        format: PixelFormat,
-        options: D::Options,
+        content: RenderedContent<D>,
         preview: Option<PathBuf>,
     ) -> Result<PrintReport> {
         self.run(
             async move |printer| {
-                let job = render::prepare(printer, image, format, &options)
+                let job = content.prepare(printer)
                     .context("Cannot prepare the job. No print data was submitted.")?;
                 if let Some(path) = preview {
                     job.preview()
@@ -97,6 +94,7 @@ impl<T: Transport, D: Driver, S: Future<Output = io::Result<()>>> Session<T, D, 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::args::Content;
     use async_trait::async_trait;
     use meowprint::{Error, Gt01, Gt01Options, TransportEvent, WriteChannel};
     use std::{
@@ -163,18 +161,21 @@ mod tests {
         Session::new(Printer::new(script, Gt01), std::future::pending())
     }
 
-    fn image() -> GrayImage {
-        GrayImage::from_pixel(384, 1, image::Luma([0]))
+    fn content() -> Result<RenderedContent<Gt01>> {
+        Content::Qr {
+            content: "session-test".into(),
+        }
+        .render(Gt01, Gt01Options::default())
     }
 
     #[tokio::test(start_paused = true)]
     async fn connected_commands_disconnect_after_success() -> Result<()> {
         let script = Script::default();
         let record = Arc::clone(&script.record);
-        let report = session(script)
-            .print(image(), PixelFormat::Mono, Gt01Options::default(), None)
-            .await?;
-        assert_eq!(report.image_rows, 1);
+        let content = content()?;
+        let (_, height) = content.dimensions();
+        let report = session(script).print(content, None).await?;
+        assert_eq!(report.image_rows, height);
         assert!(report.bytes_submitted > 0);
         assert_eq!(record.disconnects.load(Ordering::SeqCst), 1);
 
@@ -238,16 +239,13 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn preparation_failure_disconnects_without_a_submission_warning() {
+    async fn preparation_failure_disconnects_without_a_submission_warning() -> Result<()> {
         let script = Script::default();
         let record = Arc::clone(&script.record);
-        let result = session(script)
-            .print(
-                GrayImage::new(1, 1),
-                PixelFormat::Mono,
-                Gt01Options::default(),
-                None,
-            )
+        let printer = Printer::new(script, Gt01);
+        printer.cancellation().cancel();
+        let result = Session::new(printer, std::future::pending::<io::Result<()>>())
+            .print(content()?, None)
             .await;
         let error = result.err().map(|error| format!("{error:#}"));
         assert!(
@@ -263,6 +261,7 @@ mod tests {
         );
         assert_eq!(record.writes.load(Ordering::SeqCst), 0);
         assert_eq!(record.disconnects.load(Ordering::SeqCst), 1);
+        Ok(())
     }
 
     #[tokio::test(start_paused = true)]
@@ -273,12 +272,7 @@ mod tests {
         let script = Script::default();
         let record = Arc::clone(&script.record);
         let result = session(script)
-            .print(
-                image(),
-                PixelFormat::Mono,
-                Gt01Options::default(),
-                Some(path.join("preview.png")),
-            )
+            .print(content()?, Some(path.join("preview.png")))
             .await;
         std::fs::remove_file(path)?;
         let error = result.err().map(|error| format!("{error:#}"));
@@ -294,7 +288,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn cancellation_and_signal_failure_await_the_active_write_and_disconnect() {
+    async fn cancellation_and_signal_failure_await_the_active_write_and_disconnect() -> Result<()> {
         for fail_signal in [false, true] {
             let script = Script {
                 write_delay: Duration::from_secs(1),
@@ -310,7 +304,7 @@ mod tests {
                 }
             };
             let result = Session::new(Printer::new(script, Gt01), signal)
-                .print(image(), PixelFormat::Mono, Gt01Options::default(), None)
+                .print(content()?, None)
                 .await;
             let error = result.err();
             if fail_signal {
@@ -334,5 +328,6 @@ mod tests {
             assert_eq!(record.finished_writes.load(Ordering::SeqCst), 1);
             assert_eq!(record.disconnects.load(Ordering::SeqCst), 1);
         }
+        Ok(())
     }
 }

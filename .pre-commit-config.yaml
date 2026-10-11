@@ -21,3 +21,8 @@ repos:
     hooks:
     -   id: fmt
     -   id: cargo-check
+    -   id: clippy
+        args: [--locked, --workspace, --all-targets, --all-features, --, -D, warnings]
+        types: [file]
+        files: '(\.rs$|(^|/)Cargo\.(toml|lock)$|^crates/[^/]+/(assets|tests/fixtures)/|^\.pre-commit-config\.yaml$)'
+        pass_filenames: false

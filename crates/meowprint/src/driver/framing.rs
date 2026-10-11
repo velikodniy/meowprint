@@ -189,11 +189,11 @@ mod tests {
                 bytes
             );
             let mut decoder = Decoder::new(header, 255, true);
-            assert!(decoder.feed_positioned(&bytes[..1]).is_empty());
+            assert_eq!(decoder.feed_positioned(&bytes[..1]), []);
             assert_eq!(decoder.feed_positioned(&bytes[1..]), [(1, frame)]);
             let mut corrupt = bytes;
             corrupt[7] ^= 1;
-            assert!(decoder.feed_positioned(&corrupt).is_empty());
+            assert_eq!(decoder.feed_positioned(&corrupt), []);
             assert_eq!(decoder.feed_positioned(&bytes).len(), 1);
         }
         Ok(())
@@ -236,8 +236,8 @@ mod tests {
         corrupt[8] = 0;
         let oversized = [0x51, 0x78, 0xa3, 1, 0xff, 0xff];
         let mut decoder = Decoder::new([0x51, 0x78], 255, true);
-        assert!(decoder.feed_positioned(&oversized).is_empty());
-        assert!(decoder.feed_positioned(&corrupt).is_empty());
+        assert_eq!(decoder.feed_positioned(&oversized), []);
+        assert_eq!(decoder.feed_positioned(&corrupt), []);
         let frames = decoder.feed_positioned(&bytes);
         assert_eq!(frames.len(), 1);
         assert_eq!(frames[0].0, (oversized.len() + corrupt.len() + 1) as u64);

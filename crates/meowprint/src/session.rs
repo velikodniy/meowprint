@@ -543,7 +543,7 @@ mod tests {
             );
             assert_eq!(tokio::time::Instant::now(), started);
             assert!(printer.is_usable());
-            assert!(printer.session.transport.writes.is_empty());
+            assert_eq!(printer.session.transport.writes, []);
             assert_eq!(printer.session.transport.disconnects, 0);
         }
         Ok(())

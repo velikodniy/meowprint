@@ -8,13 +8,14 @@ mod error;
 mod preview;
 mod query_output;
 mod render;
+mod session;
 
-use anyhow::{Context, Result as CliResult};
+use anyhow::Result as CliResult;
 use args::{Cli, CliDriver, Command, Connection, Content, Controls, DriverArg, QueryArg};
 use clap::{Parser, ValueEnum};
 use error::Result;
 use meowprint::{
-    Cancellation, Driver, Printer,
+    Driver, Printer,
     bluetooth::{BleTransport, Bluetooth, Device},
 };
 use std::{path::PathBuf, time::Duration};
@@ -40,22 +41,6 @@ async fn connect<D: Driver>(
     eprintln!("Connected in {:.2}s.", started.elapsed().as_secs_f64());
     Ok(printer)
 }
-async fn cancellable<T>(
-    cancellation: Cancellation,
-    operation: impl Future<Output = meowprint::Result<T>>,
-) -> CliResult<T> {
-    tokio::pin!(operation);
-    tokio::select! {
-        result = &mut operation => Ok(result?),
-        signal = tokio::signal::ctrl_c() => {
-            cancellation.cancel();
-            // Keep the operation alive so its current write finishes before cancellation.
-            let result = operation.await;
-            signal.context("Cannot listen for Ctrl-C. Submission stopped.")?;
-            Ok(result?)
-        }
-    }
-}
 async fn print<D: CliDriver>(
     connection: Connection,
     driver: D,
@@ -75,22 +60,10 @@ async fn print<D: CliDriver>(
         image.height(),
         started.elapsed().as_secs_f64()
     );
-    let mut printer = connect(&connection, driver).await?;
-    let cancellation = printer.cancellation();
-    let result = async {
-        let job = render::prepare(&mut printer, image, format, &options)?;
-        if let Some(path) = preview {
-            job.preview()
-                .save_with_format(path, image::ImageFormat::Png)?;
-        }
-        eprintln!("Sending print data...");
-        cancellable(cancellation, job.print()).await
-    }
-    .await;
-    let disconnected = printer.disconnect().await;
-    let report = result.context("The job did not complete. Submitted rows have an unknown outcome. Do not retry automatically.")?;
-    disconnected
-        .context("The job was submitted, but disconnect failed. Do not reprint automatically.")?;
+    let printer = connect(&connection, driver).await?;
+    let report = session::Session::new(printer, tokio::signal::ctrl_c())
+        .print(image, format, options, preview)
+        .await?;
     println!(
         "Submitted {} image rows ({} bytes) in {:.2}s. Completion evidence: {:?}. Physical output is not confirmed.",
         report.image_rows,
@@ -101,12 +74,10 @@ async fn print<D: CliDriver>(
     Ok(())
 }
 async fn query<D: Driver>(connection: Connection, driver: D, query: QueryArg) -> CliResult<()> {
-    let mut printer = connect(&connection, driver).await?;
-    let cancellation = printer.cancellation();
-    let result = cancellable(cancellation, query_output::read(&mut printer, query)).await;
-    let disconnected = printer.disconnect().await;
-    let output = result?;
-    disconnected.context("The query succeeded, but disconnect failed.")?;
+    let printer = connect(&connection, driver).await?;
+    let output = session::Session::new(printer, tokio::signal::ctrl_c())
+        .query(query)
+        .await?;
     println!("{output}");
     Ok(())
 }
@@ -122,18 +93,10 @@ async fn movement<D: Driver>(
     } else {
         driver.validate_feed(rows)?;
     }
-    let mut printer = connect(&connection, driver).await?;
-    let cancellation = printer.cancellation();
-    let result = if retract {
-        cancellable(cancellation, printer.retract(rows)).await
-    } else {
-        cancellable(cancellation, printer.feed(rows)).await
-    };
-    let disconnected = printer.disconnect().await;
-    let report = result?;
-    disconnected.context(
-        "Paper movement was submitted, but disconnect failed. Do not repeat automatically.",
-    )?;
+    let printer = connect(&connection, driver).await?;
+    let report = session::Session::new(printer, tokio::signal::ctrl_c())
+        .movement(rows, retract)
+        .await?;
     println!(
         "Submitted {} bytes. Completion evidence: {:?}.",
         report.bytes_submitted, report.completion

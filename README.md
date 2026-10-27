@@ -40,8 +40,7 @@ The [protocol reference](crates/meowprint/docs/protocol.md) describes firmware b
 
 ## Development
 
-Install [prek](https://prek.j178.dev/installation/) and the Rust components used by the hooks.
-From the repository root, install the components and commit hooks:
+Install [prek](https://prek.j178.dev/installation/) and the Rust components used by the hooks:
 
 ```sh
 rustup component add rustfmt clippy
@@ -49,17 +48,3 @@ prek install
 ```
 
 The hooks run Rust formatting, Clippy, `cargo check`, and common file checks before each commit.
-Formatting and `cargo check` run when Rust source files change.
-Clippy also runs when Cargo manifests, Cargo lockfiles, crate assets, test fixtures, or the hook configuration change.
-Clippy covers both workspace packages, all targets, and all features.
-It uses the dependency versions recorded in `Cargo.lock` and treats warnings as errors:
-
-```sh
-cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
-```
-
-From the repository root, run all hooks manually:
-
-```sh
-prek run --all-files
-```

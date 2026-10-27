@@ -229,7 +229,9 @@ impl Device {
 ///
 /// Create one with [`Self::new`], then use [`Self::scan`] to list devices or
 /// [`Self::find`] to select a known name or identifier. Discovery uses all
-/// available powered adapters. This type does not own an active printer session.
+/// powered adapters, including those whose backend cannot query the initial
+/// power state. Scan failures are still reported.
+/// This type does not own an active printer session.
 ///
 /// # Example
 ///
@@ -257,7 +259,7 @@ impl Bluetooth {
         let adapters = bounded("Bluetooth adapters", manager.adapters()).await?;
         if adapters.is_empty() {
             return Err(Error::Bluetooth(
-                "No Bluetooth adapter is available. Enable Bluetooth and allow this terminal to use it.".into(),
+                "No Bluetooth adapter is available. Enable Bluetooth and allow this application to use it.".into(),
             ));
         }
         Ok(Self { adapters })
@@ -275,10 +277,10 @@ impl Bluetooth {
     ///
     /// # Errors
     /// Reject invalid durations, multiple matches, absent devices, unavailable
-    /// powered adapters, or Bluetooth failures.
+    /// adapters, or Bluetooth failures.
     pub async fn find(&self, selector: &str, duration: Duration) -> Result<Device> {
         scan_duration(duration)?;
-        let adapters = powered_adapters(&self.adapters, |adapter| {
+        let adapters = discovery_adapters(&self.adapters, |adapter| {
             bounded("Bluetooth state", adapter.adapter_state())
         })
         .await?;
@@ -350,7 +352,7 @@ impl Bluetooth {
         result
     }
 
-    /// List devices after scanning all powered adapters for the requested duration.
+    /// List devices after scanning all eligible adapters for the requested duration.
     ///
     /// Results include other Bluetooth devices and devices cached by the host.
     /// The returned list is sorted and deduplicated by device identifier.
@@ -362,11 +364,11 @@ impl Bluetooth {
     /// If the caller cancels discovery, scan cleanup continues on the Tokio runtime.
     ///
     /// # Errors
-    /// Reject zero durations, durations above 60 seconds, unavailable powered
-    /// adapters, or Bluetooth failures.
+    /// Reject zero durations, durations above 60 seconds, unavailable adapters,
+    /// or Bluetooth failures.
     pub async fn scan(&self, duration: Duration) -> Result<Vec<Device>> {
         scan_duration(duration)?;
-        let adapters = powered_adapters(&self.adapters, |adapter| {
+        let adapters = discovery_adapters(&self.adapters, |adapter| {
             bounded("Bluetooth state", adapter.adapter_state())
         })
         .await?;
@@ -480,27 +482,32 @@ async fn start_scan(adapter: &Adapter, scans: &mut Vec<CleanupGuard>) -> Result<
     result
 }
 
-async fn powered_adapters<'a, A, F, S>(adapters: &'a [A], mut state: F) -> Result<Vec<&'a A>>
+async fn discovery_adapters<'a, A, F, S>(adapters: &'a [A], mut state: F) -> Result<Vec<&'a A>>
 where
     A: Sync,
     F: FnMut(&'a A) -> S + Send,
     S: Future<Output = Result<CentralState>> + Send,
 {
-    let mut powered = Vec::new();
+    let mut available = Vec::new();
     let mut failure = None;
     for adapter in adapters {
         match state(adapter).await {
-            Ok(CentralState::PoweredOn) => powered.push(adapter),
+            Ok(CentralState::PoweredOn) => available.push(adapter),
+            // This backend cannot query adapter state. Permit Unknown only
+            // during the initial query; scan errors and later state events
+            // still report Bluetooth becoming unavailable.
+            #[cfg(target_os = "android")]
+            Ok(CentralState::Unknown) => available.push(adapter),
             Ok(_) => {}
             Err(error) => failure = Some(error),
         }
     }
-    if powered.is_empty() {
+    if available.is_empty() {
         return Err(failure.unwrap_or_else(|| Error::Bluetooth(
-            "No powered Bluetooth adapter is available. Enable Bluetooth and allow this terminal to use it.".into(),
+            "No Bluetooth adapter is available for discovery. Enable Bluetooth and allow this application to use it.".into(),
         )));
     }
-    Ok(powered)
+    Ok(available)
 }
 
 fn scan_duration(duration: Duration) -> Result<()> {
@@ -721,23 +728,61 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn powered_adapter_filter_preserves_available_adapters_and_errors() -> Result<()> {
-        let adapters = [0, 1, 2];
-        let powered = powered_adapters(&adapters, |value| async move {
-            Ok(if *value == 0 {
-                CentralState::PoweredOff
-            } else {
-                CentralState::PoweredOn
-            })
-        })
-        .await?;
-        assert_eq!(powered, [&1, &2]);
+    async fn discovery_adapter_filter_preserves_available_adapters_and_errors() -> Result<()> {
+        let adapters = [
+            CentralState::PoweredOff,
+            CentralState::PoweredOn,
+            CentralState::Unknown,
+        ];
+        let available =
+            discovery_adapters(&adapters, |state| async move { Ok(state.clone()) }).await?;
+        #[cfg(target_os = "android")]
+        assert_eq!(
+            available,
+            [&CentralState::PoweredOn, &CentralState::Unknown]
+        );
+        #[cfg(not(target_os = "android"))]
+        assert_eq!(available, [&CentralState::PoweredOn]);
+
         assert!(matches!(
-            powered_adapters(&adapters, |_| async { Ok(CentralState::PoweredOff) }).await,
+            discovery_adapters(&adapters, |_| async { Ok(CentralState::PoweredOff) }).await,
             Err(Error::Bluetooth(_))
         ));
+        let unknown =
+            discovery_adapters(&adapters[2..], |state| async move { Ok(state.clone()) }).await;
+        #[cfg(target_os = "android")]
+        assert_eq!(unknown?, [&CentralState::Unknown]);
+        #[cfg(not(target_os = "android"))]
+        assert!(matches!(unknown, Err(Error::Bluetooth(_))));
         assert!(
-            matches!(powered_adapters(&adapters, |_| async { Err(Error::Bluetooth("permission denied".into())) }).await, Err(Error::Bluetooth(message)) if message == "permission denied")
+            matches!(discovery_adapters(&adapters, |_| async { Err(Error::Bluetooth("permission denied".into())) }).await, Err(Error::Bluetooth(message)) if message == "permission denied")
+        );
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn discovery_uses_available_adapters_despite_other_query_failures() -> Result<()> {
+        for adapters in [[0, 1], [1, 0]] {
+            let available = discovery_adapters(&adapters, |adapter| async move {
+                if *adapter == 0 {
+                    Err(Error::Bluetooth("state query failed".into()))
+                } else {
+                    Ok(CentralState::PoweredOn)
+                }
+            })
+            .await?;
+            assert_eq!(available, [&1]);
+        }
+        let unavailable = discovery_adapters(&[0, 1], |adapter| async move {
+            if *adapter == 0 {
+                Err(Error::Bluetooth("state query failed".into()))
+            } else {
+                Ok(CentralState::PoweredOff)
+            }
+        })
+        .await;
+        assert!(
+            matches!(unavailable, Err(Error::Bluetooth(message)) if message == "state query failed")
         );
         Ok(())
     }

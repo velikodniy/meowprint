@@ -47,6 +47,8 @@ async fn main() -> meowprint::Result<()> {
 
 `Bluetooth::find` accepts an exact device name or a platform device identifier. Use `Bluetooth::scan` to list devices. If several devices share a name, use an identifier to select one.
 
+Discovery requires a powered adapter. For backends without an initial power-state query, Meowprint permits an initial `Unknown` state and lets scanning report failures. Explicit powered-off states are still rejected. If an adapter's state query fails, discovery can use other eligible adapters; if none are eligible, the query error is returned. Enable Bluetooth and grant the application Bluetooth access before discovery.
+
 ## Prepare and print pixels
 
 `Printer::prepare(bytes, format, &options)` takes ownership of packed pixels and returns a `PrintJob`. Preparation does not communicate with the printer. Call `job.print().await` to print, or drop the job to discard it. Finish or discard the job before querying the printer or preparing another job.
@@ -104,6 +106,25 @@ Preparation converts the image to black and white through dithering, which repre
 `job.preview()` returns an `image::GrayImage` of the prepared pixels. It excludes blank rows and paper feed added by the driver. Editing the preview does not change the job, and the preview does not predict physical print quality.
 
 For an offline preview, create a printer with `Printer::new(NoOpTransport, Gt01)`. Preparation and preview need no Bluetooth connection or Tokio runtime. See the [offline preview example](examples/preview.rs).
+
+To retain prepared pixels independently of a printer, use the owned `Raster` API. `Raster::new(width, bytes, format)` validates packed pixels without copying them. With the `image` feature, `Raster::from_image` performs the same positioning, white alpha compositing, and dithering as `prepare_from_image`:
+
+```rust
+use meowprint::{Dither, Driver, Gt01, Position, Raster};
+
+let raster = Raster::from_image(
+    &image,
+    Gt01.printable_width(),
+    Position::Center,
+    Dither::default(),
+)?;
+let preview = raster.preview();
+// Later, submit these exact pixels without converting the image again.
+let format = raster.format();
+let job = printer.prepare(raster.into_packed(), format, &Default::default())?;
+```
+
+Raster construction and preview need no connection or Tokio runtime. The width must fill whole bytes (a multiple of eight for Mono or two for Gray4); rows must be complete and nonempty, with at most 32,768 rows and 16,777,216 pixels. `from_image` validates these bounds before allocating conversion buffers and never resizes. Use `width()`, `height()`, `format()`, and `packed()` to inspect a raster; `into_packed()` consumes it and moves out the original buffer. Match the raster width and format to the selected driver before preparing a job.
 
 Meowprint itself does not enable image file formats. The `png` feature above enables PNG files. Enable other formats in your application's `image` dependency as needed. To use image preparation without native Bluetooth dependencies, set `default-features = false` alongside `features = ["image"]` on `meowprint`.
 

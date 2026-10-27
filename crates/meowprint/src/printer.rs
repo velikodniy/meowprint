@@ -345,8 +345,8 @@ impl<T: Transport, D: Driver> Printer<T, D> {
     ) -> Result<PrintJob<'_, T, D>> {
         self.session.ensure_usable()?;
         self.driver.validate(options, PixelFormat::Mono)?;
-        let bytes = crate::imaging::pack(image, self.printable_width(), position, dither)?;
-        self.prepare(bytes, PixelFormat::Mono, options)
+        let raster = Raster::from_image(image, self.printable_width(), position, dither)?;
+        self.prepare(raster.into_packed(), PixelFormat::Mono, options)
     }
 
     /// Move paper forward by the requested number of dot rows.

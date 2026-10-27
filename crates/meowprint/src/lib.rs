@@ -175,5 +175,4 @@ pub use printer::{
     Cancellation, Completion, NoOpTransport, PrintJob, PrintReport, Printer, Transport,
     TransportEvent, WriteChannel,
 };
-pub use raster::PixelFormat;
-pub(crate) use raster::Raster;
+pub use raster::{PixelFormat, Raster};

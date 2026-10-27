@@ -1,7 +1,6 @@
-//! Image conversion for printer-bound jobs.
+//! Image positioning and dithering.
 
-use crate::{Raster, Result, error::invalid};
-use image::{DynamicImage, GenericImageView, GrayImage, Luma};
+use image::GrayImage;
 
 /// Horizontal image position within the printable width.
 ///
@@ -15,50 +14,6 @@ pub enum Position {
     /// Center the image, with any extra white column on the right.
     #[default]
     Center,
-}
-
-/// Convert and position a bounded image as packed monochrome pixels.
-pub fn pack(
-    image: &DynamicImage,
-    width: u32,
-    position: Position,
-    dither: Dither,
-) -> Result<Vec<u8>> {
-    if image.width() == 0 || image.height() == 0 {
-        return Err(invalid("The source image is empty."));
-    }
-    if image.width() > width {
-        return Err(invalid(
-            "The image exceeds the printable width. Resize it before preparation.",
-        ));
-    }
-    Raster::validate_dimensions(width, image.height())?;
-
-    // Flatten on white before dithering. Work only within the image so that
-    // diffusion cannot put black dots in the margins or depend on its position.
-    let mut gray = GrayImage::from_fn(image.width(), image.height(), |x, y| {
-        let [r, g, b, a] = image.get_pixel(x, y).0.map(u32::from);
-        // ITU-R BT.709 luma weights (0.2126, 0.7152, 0.0722), scaled by 10000.
-        let luma = (2126 * r + 7152 * g + 722 * b + 5000) / 10000;
-        let value = (luma * a + 255 * (255 - a) + 127) / 255;
-        Luma([value.to_le_bytes()[0]])
-    });
-    dither.apply(&mut gray);
-
-    let left = match position {
-        Position::Left => 0,
-        Position::Right => width - image.width(),
-        Position::Center => (width - image.width()) / 2,
-    };
-    let row_bytes = (width / 8) as usize;
-    let mut bytes = vec![0; row_bytes * image.height() as usize];
-    for (x, y, pixel) in gray.enumerate_pixels() {
-        if pixel[0] == 0 {
-            let x = x + left;
-            bytes[y as usize * row_bytes + x as usize / 8] |= 1 << (x % 8);
-        }
-    }
-    Ok(bytes)
 }
 
 /// A method for converting gray pixels to black and white dots.

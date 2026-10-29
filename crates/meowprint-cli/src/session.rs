@@ -3,7 +3,7 @@
 use crate::{args::QueryArg, content::RenderedContent, query_output};
 use anyhow::{Context, Result};
 use meowprint::{Driver, PrintReport, Printer, Transport};
-use std::{io, path::PathBuf};
+use std::io;
 
 /// Own a connected printer session and its source of cancellation.
 pub struct Session<T, D: Driver, S> {
@@ -17,25 +17,16 @@ impl<T: Transport, D: Driver, S: Future<Output = io::Result<()>>> Session<T, D, 
         Self { printer, signal }
     }
 
-    /// Prepare and submit a print job, then close the printer session.
-    pub async fn print(
-        self,
-        content: RenderedContent<D>,
-        preview: Option<PathBuf>,
-    ) -> Result<PrintReport> {
+    /// Submit rendered raster rows, then close the printer session.
+    pub async fn print(self, content: RenderedContent<D>) -> Result<PrintReport> {
         self.run(
             async move |printer| {
-                let job = content.prepare(printer)
-                    .context("Cannot prepare the job. No print data was submitted.")?;
-                if let Some(path) = preview {
-                    job.preview()
-                        .save_with_format(path, image::ImageFormat::Png)
-                        .context("Cannot save the preview. No print data was submitted.")?;
-                }
+                let RenderedContent { raster, options } = content;
+                let mut rows = raster.rows();
                 eprintln!("Sending print data...");
-                job.print().await.context("The job did not complete. Submitted rows have an unknown outcome. Do not retry automatically.")
+                printer.print(&mut rows, &options).await.context("The print operation did not complete. Submitted rows have an unknown outcome. Do not retry automatically.")
             },
-            "The job was submitted, but disconnect failed. Do not reprint automatically.",
+            "The print operation was submitted, but disconnect failed. Do not reprint automatically.",
         )
         .await
     }
@@ -174,7 +165,7 @@ mod tests {
         let record = Arc::clone(&script.record);
         let content = content()?;
         let (_, height) = content.dimensions();
-        let report = session(script).print(content, None).await?;
+        let report = session(script).print(content).await?;
         assert_eq!(report.image_rows, height);
         assert!(report.bytes_submitted > 0);
         assert_eq!(record.disconnects.load(Ordering::SeqCst), 1);
@@ -239,47 +230,19 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn preparation_failure_disconnects_without_a_submission_warning() -> Result<()> {
+    async fn cancelled_print_disconnects_without_writing() -> Result<()> {
         let script = Script::default();
         let record = Arc::clone(&script.record);
         let printer = Printer::new(script, Gt01);
         printer.cancellation().cancel();
         let result = Session::new(printer, std::future::pending::<io::Result<()>>())
-            .print(content()?, None)
+            .print(content()?)
             .await;
         let error = result.err().map(|error| format!("{error:#}"));
         assert!(
             error
                 .as_deref()
-                .is_some_and(|error| error.contains("No print data was submitted.")),
-            "{error:?}"
-        );
-        assert!(
-            !error
-                .as_deref()
-                .is_some_and(|error| error.contains("unknown outcome"))
-        );
-        assert_eq!(record.writes.load(Ordering::SeqCst), 0);
-        assert_eq!(record.disconnects.load(Ordering::SeqCst), 1);
-        Ok(())
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn preview_save_failure_disconnects_before_submission() -> Result<()> {
-        let path =
-            std::env::temp_dir().join(format!("meowprint-preview-parent-{}", std::process::id()));
-        std::fs::write(&path, [])?;
-        let script = Script::default();
-        let record = Arc::clone(&script.record);
-        let result = session(script)
-            .print(content()?, Some(path.join("preview.png")))
-            .await;
-        std::fs::remove_file(path)?;
-        let error = result.err().map(|error| format!("{error:#}"));
-        assert!(
-            error.as_deref().is_some_and(
-                |error| error.contains("Cannot save the preview. No print data was submitted.")
-            ),
+                .is_some_and(|error| error.contains("unknown outcome")),
             "{error:?}"
         );
         assert_eq!(record.writes.load(Ordering::SeqCst), 0);
@@ -304,7 +267,7 @@ mod tests {
                 }
             };
             let result = Session::new(Printer::new(script, Gt01), signal)
-                .print(content()?, None)
+                .print(content()?)
                 .await;
             let error = result.err();
             if fail_signal {

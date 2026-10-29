@@ -6,8 +6,7 @@ use crate::{Result, error::invalid};
 
 /// Compute payload-only CRC-8 with polynomial `0x07` and initial value zero.
 ///
-/// A CRC is a checksum that detects transmission errors. Frame encoders call
-/// this helper internally. Headers, length fields, and terminators are excluded.
+/// Headers, length fields, and terminators are excluded.
 #[must_use]
 pub fn crc8(payload: &[u8]) -> u8 {
     payload.iter().fold(0, |mut crc, &byte| {
@@ -23,14 +22,10 @@ pub fn crc8(payload: &[u8]) -> u8 {
     })
 }
 
-/// A command byte, direction byte, and exact payload from a protocol message.
+/// A decoded command, direction byte, and payload, without the frame header.
 ///
-/// [`Decoder`] returns this type for protocol processing.
-/// Unknown commands and payload bytes remain intact.
-///
-/// The value does not record its header or receive format. Keep that context
-/// separately. Frames decoded without a CRC receive no checksum test. A manually constructed frame carries
-/// no evidence that it came from a printer.
+/// Unknown commands and payloads are preserved. CRC validation depends on the
+/// decoder's policy; a frame alone does not establish its origin.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Frame {
     /// The family-specific command byte.
@@ -43,10 +38,16 @@ pub struct Frame {
 /// An outgoing command whose identity remains available after encoding.
 #[derive(Debug)]
 pub struct EncodedCommand {
+    /// Command byte used to match replies.
     pub command: u8,
+    /// Complete frame ready for transmission.
     pub bytes: Vec<u8>,
 }
 
+/// Encode a complete frame with a payload-only CRC and `0xff` terminator.
+///
+/// # Errors
+/// Reject payloads above `max_payload` or 65535 bytes.
 pub fn encode(
     header: [u8; 2],
     command: u8,
@@ -54,34 +55,67 @@ pub fn encode(
     payload: &[u8],
     max_payload: usize,
 ) -> Result<Vec<u8>> {
-    let len = u16::try_from(payload.len())
+    validate_payload(payload.len(), max_payload)?;
+    let mut bytes = vec![0; payload.len() + 8];
+    bytes[6..6 + payload.len()].copy_from_slice(payload);
+    finish_into(
+        header,
+        command,
+        direction,
+        payload.len(),
+        max_payload,
+        &mut bytes,
+    )?;
+    Ok(bytes)
+}
+
+/// Finish a frame whose payload is already in `output[6..6 + payload_len]`.
+///
+/// Write the header, length, payload-only CRC, and terminator without moving the
+/// payload. Return the complete frame length, `payload_len + 8`.
+///
+/// # Errors
+/// Reject payloads above `max_payload` or 65535 bytes, or an undersized buffer.
+pub fn finish_into(
+    header: [u8; 2],
+    command: u8,
+    direction: u8,
+    payload_len: usize,
+    max_payload: usize,
+    output: &mut [u8],
+) -> Result<usize> {
+    validate_payload(payload_len, max_payload)?;
+    if output.len() < payload_len + 8 {
+        return Err(invalid("The frame output buffer is too small."));
+    }
+    let len = u16::try_from(payload_len)
         .map_err(|_| invalid("A frame cannot exceed 65535 payload bytes."))?;
-    if payload.len() > max_payload {
+    output[..2].copy_from_slice(&header);
+    output[2] = command;
+    output[3] = direction;
+    output[4..6].copy_from_slice(&len.to_le_bytes());
+    output[6 + payload_len] = crc8(&output[6..6 + payload_len]);
+    output[7 + payload_len] = 0xff;
+    Ok(payload_len + 8)
+}
+
+fn validate_payload(payload_len: usize, max_payload: usize) -> Result<()> {
+    u16::try_from(payload_len)
+        .map_err(|_| invalid("A frame cannot exceed 65535 payload bytes."))?;
+    if payload_len > max_payload {
         return Err(invalid(
             "The frame exceeds the selected driver payload limit.",
         ));
     }
-    let mut bytes = Vec::with_capacity(payload.len() + 8);
-    bytes.extend_from_slice(&header);
-    bytes.extend_from_slice(&[command, direction]);
-    bytes.extend_from_slice(&len.to_le_bytes());
-    bytes.extend_from_slice(payload);
-    bytes.extend_from_slice(&[crc8(payload), 0xff]);
-    Ok(bytes)
+    Ok(())
 }
 
-/// A stateful parser that joins notification bytes into complete [`Frame`] values.
+/// An incremental reply parser with a driver-selected header and CRC policy.
 ///
-/// Keep one decoder for each incoming connection. Call `feed_positioned` for every
-/// notification in order, even when it contains only part of a frame.
-/// One call can produce zero, one, or several frames. Incomplete bytes remain
-/// buffered for the next call. Memory for buffered bytes has a fixed upper limit.
-///
-/// The decoder only returns frames with an accepted length and terminator.
-/// It requires a CRC unless you explicitly select MXW01 replies without one.
-/// It does not interpret commands, match requests to replies, or impose time limits.
-/// [`Printer`](crate::Printer) supplies that session behavior.
-///
+/// Feed notifications in order using one decoder per connection. Incomplete
+/// frames remain buffered; invalid headers, lengths, CRCs, and terminators are
+/// skipped. Buffered length is bounded by the maximum frame size.
+/// Request matching and timeouts belong to the session.
 #[derive(Debug)]
 pub struct Decoder {
     buffer: Vec<u8>,
@@ -104,10 +138,13 @@ impl Decoder {
             check_crc,
         }
     }
+    /// Return the number of input bytes received, including discarded bytes.
     pub(crate) const fn position(&self) -> u64 {
         self.received
     }
-    // Each position identifies the first byte, including a preamble split across notifications.
+    /// Decode frames with one-based positions of their first header byte.
+    ///
+    /// Positions remain stable when a frame spans multiple notifications.
     pub fn feed_positioned(&mut self, bytes: &[u8]) -> Vec<(u64, Frame)> {
         let mut frames = Vec::new();
         let header = self.header;
@@ -241,6 +278,19 @@ mod tests {
         let frames = decoder.feed_positioned(&bytes);
         assert_eq!(frames.len(), 1);
         assert_eq!(frames[0].0, (oversized.len() + corrupt.len() + 1) as u64);
+        Ok(())
+    }
+
+    #[test]
+    fn finish_into_matches_encode_and_checks_output_limits() -> crate::Result<()> {
+        let payload = [1, 2, 3, 4];
+        let mut output = [0; 12];
+        output[6..10].copy_from_slice(&payload);
+        let len = super::finish_into([0x51, 0x78], 0xa1, 0, payload.len(), 4, &mut output)?;
+        assert_eq!(len, 12);
+        assert_eq!(output.to_vec(), encode([0x51, 0x78], 0xa1, 0, &payload, 4)?);
+        assert!(super::finish_into([0; 2], 0, 0, 4, 4, &mut [0; 11]).is_err());
+        assert!(super::finish_into([0; 2], 0, 0, 5, 4, &mut [0; 13]).is_err());
         Ok(())
     }
 }

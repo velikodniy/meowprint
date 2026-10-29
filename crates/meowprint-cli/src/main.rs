@@ -9,7 +9,7 @@ mod query_output;
 mod render;
 mod session;
 
-use anyhow::Result as CliResult;
+use anyhow::{Context, Result as CliResult};
 use args::{Cli, CliDriver, Command, Connection, Content, Controls, DriverArg, QueryArg};
 use clap::{Parser, ValueEnum};
 use error::Result;
@@ -58,9 +58,15 @@ async fn print<D: CliDriver>(
         height,
         started.elapsed().as_secs_f64()
     );
+    if let Some(path) = preview {
+        content
+            .preview()
+            .save_with_format(path, image::ImageFormat::Png)
+            .context("Cannot save the preview. No print data was submitted.")?;
+    }
     let printer = connect(&connection, driver).await?;
     let report = session::Session::new(printer, tokio::signal::ctrl_c())
-        .print(content, preview)
+        .print(content)
         .await?;
     println!(
         "Submitted {} image rows ({} bytes) in {:.2}s. Completion evidence: {:?}. Physical output is not confirmed.",
@@ -147,7 +153,7 @@ async fn execute<D: CliDriver>(command: Command, driver: D) -> CliResult<()> {
             "{}: {} dots, grayscale {}",
             driver.name(),
             driver.printable_width(),
-            driver.supports_gray4()
+            driver.supports(meowprint::PixelFormat::Gray4)
         ),
         Command::Preview {
             output, content, ..
@@ -155,7 +161,7 @@ async fn execute<D: CliDriver>(command: Command, driver: D) -> CliResult<()> {
             let content = content.render(driver, Default::default())?;
             let (width, height) = content.dimensions();
             content
-                .preview()?
+                .preview()
                 .save_with_format(&output, image::ImageFormat::Png)?;
             println!("Saved {} ({} x {} dots).", output.display(), width, height);
         }

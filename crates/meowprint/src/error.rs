@@ -2,10 +2,11 @@
 
 /// An error from pixel input, encoding, Bluetooth access, or a printer operation.
 ///
-/// Preparation errors leave a [`Printer`](crate::Printer) usable. Communication
-/// failures disable the connection. A known printer condition rejected before a
-/// write leaves it usable. Any error after a write attempt disables the connection.
-/// Previously submitted rows can still print.
+/// Invalid source metadata or controls leave a [`Printer`](crate::Printer) usable.
+/// Once submission begins, source or compression failures disable the connection,
+/// even before the first write. Communication failures also disable it. A genuine
+/// printer condition rejected before a write leaves it usable. Any error after
+/// a write attempt disables the connection. Previously submitted rows can still print.
 ///
 /// No operation is retried automatically. See [`Printer::is_usable`](crate::Printer::is_usable)
 /// for connection state and [`Printer::disconnect`](crate::Printer::disconnect) for explicit cleanup.
@@ -14,7 +15,7 @@ pub enum Error {
     /// An input value is invalid or the requested operation is unsupported.
     #[error("{0}")]
     InvalidInput(String),
-    /// Compression failed before submission.
+    /// Pixel compression failed; earlier rows may already have been submitted.
     #[error("Compression failed: {0}")]
     Compression(String),
     /// The host Bluetooth stack rejected an operation.

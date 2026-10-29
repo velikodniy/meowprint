@@ -264,7 +264,7 @@ pub struct TextArgs {
     /// Font size in dots, default 28.
     pub size: f32,
     #[arg(long, default_value_t = 12)]
-    /// Horizontal margin in dots, default 12.
+    /// Margin on all sides in dots, default 12.
     pub margin: u32,
 }
 #[derive(Clone, Copy, ValueEnum)]

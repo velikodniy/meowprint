@@ -551,7 +551,7 @@ fn endpoints<'a>(
     services: impl Iterator<Item = &'a Service>,
     driver: impl Driver,
 ) -> Result<(Characteristic, Characteristic, Characteristic)> {
-    let required = driver.settings().endpoints;
+    let required = driver.ble_profile();
     let mut pairs = services
         .filter(|s| {
             required
@@ -724,6 +724,20 @@ mod tests {
         assert_eq!(notify.uuid, NOTIFY);
         let (_, raster, _) = endpoints(std::iter::once(&service), crate::Gt01)?;
         assert_eq!(raster.uuid, WRITE);
+        Ok(())
+    }
+
+    #[test]
+    fn af30_only_service_is_selected() -> Result<()> {
+        let alternative = service(
+            ADVERTISED_SERVICE,
+            CharPropFlags::WRITE_WITHOUT_RESPONSE,
+            CharPropFlags::NOTIFY,
+        );
+        let (control, raster, notify) = endpoints(std::iter::once(&alternative), crate::Gt01)?;
+        assert_eq!(control.uuid, WRITE);
+        assert_eq!(raster.uuid, WRITE);
+        assert_eq!(notify.uuid, NOTIFY);
         Ok(())
     }
 

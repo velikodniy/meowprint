@@ -24,9 +24,7 @@ Save a PNG preview for the MX10 driver:
 meowprint preview --driver mx10 -o preview.png image input.jpg
 ```
 
-Previews require `--driver` to select the printable width and supported pixel formats.
-The preview uses `NoOpTransport` and the library's prepared-job pixels.
-It performs no Bluetooth access. With `print --preview`, the preview comes from the exact job submitted to the connected printer.
+Previews are expanded from the packed raster without Bluetooth access. The CLI renders and packs the full page before connecting; `print --preview` saves that exact raster before discovery or submission.
 
 Find your printer and list the available drivers:
 
@@ -34,6 +32,11 @@ Find your printer and list the available drivers:
 meowprint scan
 meowprint drivers
 ```
+
+`meowprint drivers` needs no Bluetooth access. Every listed driver supports Mono.
+Its `grayscale true` entries (X6h and V5g) also support Gray4 through `image --grayscale`;
+`grayscale false` means Mono only. See the [supported-format table](../meowprint/README.md#supported-pixel-formats)
+for all drivers and the library's capability checks.
 
 The `--device` value selects a printer by name or identifier from the scan.
 The `--driver` value selects the commands for its firmware.
@@ -50,9 +53,7 @@ Roboto supports Latin, Greek, and Cyrillic text.
 Use `text --font path/to/font.ttf` to select another TrueType or OpenType font.
 
 Run `meowprint --help` for all commands and `meowprint print --help` for print controls.
-The CLI renders the image before it opens a Bluetooth connection.
-The library prepares and compresses the complete image before it sends any bytes.
-The selected driver owns command order and timing.
+The CLI renders, validates, and packs input before opening a Bluetooth connection. During printing, the library submits rows incrementally rather than compressing the complete page in advance. A later input or compression failure can occur after earlier rows were sent; the print outcome is then unknown, so do not retry automatically.
 See the [protocol reference](https://docs.rs/meowprint/latest/meowprint/protocol/index.html) for firmware compatibility.
 
 ## Read printer information

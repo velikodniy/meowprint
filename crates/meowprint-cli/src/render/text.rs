@@ -13,7 +13,7 @@ pub struct Text {
     font: Font,
     /// Font size in dots, default 28.
     pub size: f32,
-    /// Horizontal margin in dots, default 12.
+    /// Margin on all sides in dots, default 12.
     pub margin: u32,
 }
 

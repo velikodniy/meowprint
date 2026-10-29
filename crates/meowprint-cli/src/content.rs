@@ -1,65 +1,27 @@
-//! Private command-line input and content preparation.
+//! Private command-line input and rendered raster content.
 use crate::{
     args::{Content, DitherArg},
-    render::{Dither, Image, QrCode, Text},
+    render::{Image, QrCode, Text},
 };
 use anyhow::{Context, Result};
 use image::{DynamicImage, GrayImage};
-use meowprint::{Driver, NoOpTransport, PixelFormat, Position, PrintJob, Printer, Transport};
+use meowprint::{Dither, Driver, ImageConversion, PixelFormat, Position, Raster};
 
-/// Rendered pixels and controls for one selected driver.
+/// Rendered raster pixels and controls for one selected driver.
 pub struct RenderedContent<D: Driver> {
-    driver: D,
-    image: GrayImage,
-    format: PixelFormat,
-    options: D::Options,
+    pub(crate) raster: Raster,
+    pub(crate) options: D::Options,
 }
 
 impl<D: Driver> RenderedContent<D> {
     /// Return the rendered width and height in dots.
-    pub fn dimensions(&self) -> (u32, u32) {
-        self.image.dimensions()
+    pub const fn dimensions(&self) -> (u32, u32) {
+        (self.raster.width(), self.raster.height())
     }
 
-    /// Create a job bound to the supplied printer session without communication.
-    pub fn prepare<T: Transport>(
-        self,
-        printer: &mut Printer<T, D>,
-    ) -> meowprint::Result<PrintJob<'_, T, D>> {
-        if self.image.width() != printer.printable_width() {
-            return Err(meowprint::Error::InvalidInput(
-                "Image width does not match the selected printer driver.".into(),
-            ));
-        }
-        match self.format {
-            PixelFormat::Mono => printer.prepare_from_image(
-                &DynamicImage::ImageLuma8(self.image),
-                Position::Center,
-                Dither::Threshold,
-                &self.options,
-            ),
-            PixelFormat::Gray4 => {
-                let bytes = self
-                    .image
-                    .as_raw()
-                    .as_chunks::<2>()
-                    .0
-                    .iter()
-                    .map(|pair| {
-                        let left = 15 - (u16::from(pair[0]) + 8) / 17;
-                        let right = 15 - (u16::from(pair[1]) + 8) / 17;
-                        (left | (right << 4)).to_le_bytes()[0]
-                    })
-                    .collect();
-                printer.prepare(bytes, self.format, &self.options)
-            }
-        }
-    }
-
-    /// Prepare and expand pixels offline without a connection or runtime.
-    pub fn preview(self) -> meowprint::Result<GrayImage> {
-        let mut printer = Printer::new(NoOpTransport, self.driver);
-        Ok(self.prepare(&mut printer)?.preview())
+    /// Expand the packed raster into grayscale pixels for an offline preview.
+    pub fn preview(&self) -> GrayImage {
+        self.raster.preview()
     }
 }
 
@@ -119,68 +81,42 @@ impl Content {
                 text.render(driver)?
             }
         };
-        Ok(RenderedContent {
-            driver,
-            image,
-            format,
-            options,
-        })
+        let conversion = match format {
+            PixelFormat::Mono => ImageConversion::Mono(Dither::Threshold),
+            PixelFormat::Gray4 => ImageConversion::Gray4,
+        };
+        let raster = Raster::from_image(
+            &DynamicImage::ImageLuma8(image),
+            driver.printable_width(),
+            Position::Center,
+            conversion,
+        )?;
+        Ok(RenderedContent { raster, options })
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use async_trait::async_trait;
-    use meowprint::{Gt01, Printer, Transport, TransportEvent, WriteChannel, X6h};
-    use std::sync::{
-        Arc,
-        atomic::{AtomicUsize, Ordering},
-    };
-
-    struct NoIo(Arc<AtomicUsize>);
-
-    #[async_trait]
-    impl Transport for NoIo {
-        async fn write(&mut self, _: WriteChannel, _: &[u8]) -> meowprint::Result<()> {
-            self.0.fetch_add(1, Ordering::SeqCst);
-            Err(meowprint::Error::Transport("Unexpected write".into()))
-        }
-
-        async fn event(&mut self) -> meowprint::Result<TransportEvent> {
-            self.0.fetch_add(1, Ordering::SeqCst);
-            Err(meowprint::Error::Transport("Unexpected event read".into()))
-        }
-
-        async fn disconnect(&mut self) -> meowprint::Result<()> {
-            Ok(())
-        }
-    }
+    use meowprint::{Gt01, X6h};
 
     fn compare_previews(driver: impl Driver, fixture: &str, grayscale: bool) -> Result<()> {
         let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("tests/fixtures")
             .join(fixture);
-        let content = || Content::Image {
+        let content = Content::Image {
             path: source.clone(),
             dither: DitherArg::Threshold,
             grayscale,
-        };
-        let calls = Arc::new(AtomicUsize::new(0));
-        let mut printer = Printer::new(NoIo(Arc::clone(&calls)), driver);
-        let connected = content()
-            .render(driver, Default::default())?
-            .prepare(&mut printer)?
-            .preview();
-        let offline = content().render(driver, Default::default())?.preview()?;
-        assert_eq!(connected, offline);
-        assert_eq!(offline, image::open(source)?.to_luma8());
-        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        }
+        .render(driver, Default::default())?;
+        let preview = content.preview();
+        assert_eq!(preview, image::open(source)?.to_luma8());
         Ok(())
     }
 
     #[test]
-    fn prepared_previews_match_offline_and_connected_sessions_without_io() -> Result<()> {
+    fn raster_previews_preserve_mono_and_gray4_pixels() -> Result<()> {
         compare_previews(Gt01, "image.png", false)?;
         compare_previews(X6h, "gray.png", true)
     }

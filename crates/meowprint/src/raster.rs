@@ -1,8 +1,8 @@
 //! Packed raster pixels.
 
 #[cfg(feature = "image")]
-use crate::{Dither, Position};
-use crate::{Result, error::invalid};
+use crate::{ImageConversion, Position};
+use crate::{Result, RowSource, error::invalid};
 #[cfg(feature = "image")]
 use image::{DynamicImage, GenericImageView, GrayImage, Luma};
 
@@ -10,7 +10,7 @@ use image::{DynamicImage, GenericImageView, GrayImage, Luma};
 ///
 /// Both formats store pixels from left to right and rows from top to bottom.
 /// Pixel values describe darkness: zero is white and the largest value is black.
-/// Pass the format to [`Printer::prepare`](crate::Printer::prepare) with the packed bytes.
+/// Use [`Raster::rows`] or implement [`RowSource`] to supply packed pixels.
 /// Rows must fill the printable width without headers or gaps between rows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PixelFormat {
@@ -34,6 +34,42 @@ pub struct Raster {
     width: u32,
     format: PixelFormat,
     bytes: Vec<u8>,
+}
+
+/// A borrowed forward-only cursor over a [`Raster`]'s packed rows.
+///
+/// Obtain a fresh cursor with [`Raster::rows`] to explicitly replay the pixels.
+/// Reading copies one row into the supplied buffer without allocating or
+/// consuming the raster. A failed read never advances the cursor.
+pub struct RasterRows<'a> {
+    raster: &'a Raster,
+    cursor: usize,
+}
+
+impl RowSource for RasterRows<'_> {
+    fn width(&self) -> u32 {
+        self.raster.width()
+    }
+    fn height(&self) -> u32 {
+        self.raster.height()
+    }
+    fn format(&self) -> PixelFormat {
+        self.raster.format()
+    }
+    fn read_row(&mut self, output: &mut [u8]) -> impl Future<Output = Result<()>> + Send {
+        if output.len() != self.raster.row_bytes() {
+            return std::future::ready(Err(invalid(
+                "The row buffer does not match the raster row size.",
+            )));
+        }
+        if self.cursor == self.raster.bytes.len() {
+            return std::future::ready(Err(invalid("The raster row source is exhausted.")));
+        }
+        let end = self.cursor + output.len();
+        output.copy_from_slice(&self.raster.bytes[self.cursor..end]);
+        self.cursor = end;
+        std::future::ready(Ok(()))
+    }
 }
 
 impl Raster {
@@ -98,26 +134,33 @@ impl Raster {
         Ok(raster)
     }
 
-    /// Convert and position an image as packed monochrome pixels.
+    /// Convert and position an image as packed monochrome or four-bit grayscale pixels.
     ///
     /// Available with the `image` feature. The source keeps its size; resize it
     /// before calling if needed. Transparency is composited on white before
-    /// dithering, and unused columns remain white regardless of dithering.
-    /// The returned raster always uses [`PixelFormat::Mono`].
+    /// conversion, and unused columns remain white.
+    /// [`ImageConversion::Mono`] dithers only the source image, not its margins.
+    /// [`ImageConversion::Gray4`] rounds luminance to 16 levels and packs the
+    /// left pixel in the low nibble, with zero denoting white.
     ///
     /// # Errors
-    /// Reject an empty source, zero or non-byte-aligned width, an image wider
-    /// than `width`, or dimensions above 32,768 rows or 16,777,216 pixels.
+    /// Reject an empty source, zero width, an image wider than `width`, or
+    /// dimensions above 32,768 rows or 16,777,216 pixels. The output width must
+    /// be a multiple of eight for Mono or two for Gray4; source widths may be odd.
     /// All dimension checks occur before allocating conversion buffers.
     #[cfg(feature = "image")]
     pub fn from_image(
         image: &DynamicImage,
         width: u32,
         position: Position,
-        dither: Dither,
+        conversion: ImageConversion,
     ) -> Result<Self> {
         Self::validate_dimensions(width, image.height())?;
-        if !width.is_multiple_of(8) {
+        let (format, pixels_per_byte) = match conversion {
+            ImageConversion::Mono(_) => (PixelFormat::Mono, 8),
+            ImageConversion::Gray4 => (PixelFormat::Gray4, 2),
+        };
+        if !width.is_multiple_of(pixels_per_byte) {
             return Err(invalid(
                 "The raster width must fill whole bytes in the selected pixel format.",
             ));
@@ -131,33 +174,50 @@ impl Raster {
             ));
         }
 
-        // Flatten on white before dithering. Work only within the image so that
-        // diffusion cannot put black dots in the margins or depend on its position.
-        let mut gray = GrayImage::from_fn(image.width(), image.height(), |x, y| {
+        let luminance = |x, y| {
             let [r, g, b, a] = image.get_pixel(x, y).0.map(u32::from);
             // ITU-R BT.709 luma weights (0.2126, 0.7152, 0.0722), scaled by 10000.
             let luma = (2126 * r + 7152 * g + 722 * b + 5000) / 10000;
             let value = (luma * a + 255 * (255 - a) + 127) / 255;
-            Luma([value.to_le_bytes()[0]])
-        });
-        dither.apply(&mut gray);
+            value.to_le_bytes()[0]
+        };
 
         let left = match position {
             Position::Left => 0,
             Position::Right => width - image.width(),
             Position::Center => (width - image.width()) / 2,
         };
-        let row_bytes = (width / 8) as usize;
+        let row_bytes = (width / pixels_per_byte) as usize;
         let mut bytes = vec![0; row_bytes * image.height() as usize];
-        for (x, y, pixel) in gray.enumerate_pixels() {
-            if pixel[0] == 0 {
-                let x = x + left;
-                bytes[y as usize * row_bytes + x as usize / 8] |= 1 << (x % 8);
+        match conversion {
+            ImageConversion::Mono(dither) => {
+                // Diffuse only within the source so margins cannot affect its dots.
+                let mut gray = GrayImage::from_fn(image.width(), image.height(), |x, y| {
+                    Luma([luminance(x, y)])
+                });
+                dither.apply(&mut gray);
+                for (x, y, pixel) in gray.enumerate_pixels() {
+                    if pixel[0] == 0 {
+                        let x = x + left;
+                        bytes[y as usize * row_bytes + x as usize / 8] |= 1 << (x % 8);
+                    }
+                }
+            }
+            ImageConversion::Gray4 => {
+                // Quantize directly into packed output; no grayscale scratch image.
+                for y in 0..image.height() {
+                    for x in 0..image.width() {
+                        let darkness = 15 - (u16::from(luminance(x, y)) + 8) / 17;
+                        let x = x + left;
+                        bytes[y as usize * row_bytes + x as usize / 2] |=
+                            darkness.to_le_bytes()[0] << ((x % 2) * 4);
+                    }
+                }
             }
         }
         Ok(Self {
             width,
-            format: PixelFormat::Mono,
+            format,
             bytes,
         })
     }
@@ -192,6 +252,18 @@ impl Raster {
     #[must_use]
     pub fn into_packed(self) -> Vec<u8> {
         self.bytes
+    }
+    /// Borrow a fresh row cursor for [`crate::Printer::print`].
+    ///
+    /// Each call starts at the first row. No pixels are cloned or consumed.
+    /// Raster validation does not prevalidate driver controls or compression;
+    /// later compression failures during printing may leave partial output.
+    #[must_use]
+    pub const fn rows(&self) -> RasterRows<'_> {
+        RasterRows {
+            raster: self,
+            cursor: 0,
+        }
     }
     /// Return the byte count for one row.
     #[must_use]
@@ -230,6 +302,41 @@ impl Raster {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn row_cursor_preserves_position_on_errors_and_restarts_explicitly() -> Result<()> {
+        for (format, width) in [(PixelFormat::Mono, 16), (PixelFormat::Gray4, 4)] {
+            let raster = Raster::new(width, vec![0x81, 0x23, 0x45, 0x67], format)?;
+            let mut rows = raster.rows();
+            assert_eq!(
+                (rows.width(), rows.height(), rows.format()),
+                (width, 2, format)
+            );
+            let mut wrong = [0xee; 3];
+            assert!(matches!(
+                rows.read_row(&mut wrong).await,
+                Err(crate::Error::InvalidInput(_))
+            ));
+            assert_eq!(wrong, [0xee; 3]);
+            let mut row = [0; 2];
+            rows.read_row(&mut row).await?;
+            assert_eq!(row, [0x81, 0x23]);
+            assert!(rows.read_row(&mut []).await.is_err());
+            rows.read_row(&mut row).await?;
+            assert_eq!(row, [0x45, 0x67]);
+            for _ in 0..2 {
+                assert!(matches!(
+                    rows.read_row(&mut row).await,
+                    Err(crate::Error::InvalidInput(_))
+                ));
+                assert_eq!(row, [0x45, 0x67]);
+                assert_eq!(rows.cursor, raster.packed().len());
+            }
+            raster.rows().read_row(&mut row).await?;
+            assert_eq!(row, [0x81, 0x23]);
+        }
+        Ok(())
+    }
     #[test]
     fn bounds_derive_from_width_and_reject_partial_rows() -> Result<()> {
         assert_eq!(Raster::max_height(384), 32768);
@@ -283,10 +390,15 @@ mod tests {
             (1, 1, 16_777_224),
         ] {
             let image = DynamicImage::new_luma8(source_width, source_height);
-            assert!(
-                Raster::from_image(&image, width, Position::Center, Dither::Threshold).is_err(),
-                "source {source_width}x{source_height}, raster width {width}",
-            );
+            for conversion in [
+                ImageConversion::Mono(crate::Dither::Threshold),
+                ImageConversion::Gray4,
+            ] {
+                assert!(
+                    Raster::from_image(&image, width, Position::Center, conversion).is_err(),
+                    "source {source_width}x{source_height}, raster width {width}, {conversion:?}",
+                );
+            }
         }
     }
 
@@ -306,17 +418,82 @@ mod tests {
         let source = DynamicImage::ImageRgba8(image::RgbaImage::from_fn(8, 1, |x, _| {
             image::Rgba(pixels[x as usize])
         }));
-        let raster = Raster::from_image(&source, 8, Position::Center, Dither::Threshold)?;
+        let raster = Raster::from_image(
+            &source,
+            8,
+            Position::Center,
+            ImageConversion::Mono(crate::Dither::Threshold),
+        )?;
         assert_eq!(raster.format(), PixelFormat::Mono);
         assert_eq!(raster.packed(), &[0x5c]);
         assert_eq!(raster.preview().as_raw(), &[255, 255, 0, 0, 0, 255, 0, 255]);
         assert_eq!(raster.into_packed(), [0x5c]);
+        let gray = Raster::from_image(&source, 8, Position::Center, ImageConversion::Gray4)?;
+        assert_eq!(gray.format(), PixelFormat::Gray4);
+        assert_eq!(gray.packed(), &[0x70, 0xf8, 0x4c, 0x0e]);
+        assert_eq!(
+            gray.preview().as_raw(),
+            &[255, 136, 119, 0, 51, 187, 17, 255]
+        );
+        Ok(())
+    }
+
+    #[cfg(feature = "image")]
+    #[test]
+    fn gray4_quantizes_boundaries_and_packs_all_levels() -> Result<()> {
+        let values = [0, 8, 9, 25, 26, 246, 247, 255];
+        let source =
+            DynamicImage::ImageLuma8(GrayImage::from_fn(8, 1, |x, _| Luma([values[x as usize]])));
+        let raster = Raster::from_image(&source, 8, Position::Left, ImageConversion::Gray4)?;
+        assert_eq!(raster.packed(), &[0xff, 0xee, 0x1d, 0x00]);
+
+        let source = DynamicImage::ImageLuma8(GrayImage::from_fn(16, 1, |x, _| {
+            Luma([(x * 17).to_le_bytes()[0]])
+        }));
+        let raster = Raster::from_image(&source, 16, Position::Left, ImageConversion::Gray4)?;
+        assert_eq!(
+            raster.packed(),
+            &[0xef, 0xcd, 0xab, 0x89, 0x67, 0x45, 0x23, 0x01]
+        );
+        assert_eq!(raster.preview(), source.to_luma8());
+        Ok(())
+    }
+
+    #[cfg(feature = "image")]
+    #[test]
+    fn gray4_positions_odd_width_rows_without_crossing_row_boundaries() -> Result<()> {
+        let values = [[0, 119, 255], [255, 136, 0]];
+        let source = DynamicImage::ImageLuma8(GrayImage::from_fn(3, 2, |x, y| {
+            Luma([values[y as usize][x as usize]])
+        }));
+        for (position, expected) in [
+            (Position::Left, [0x8f, 0, 0, 0x70, 0x0f, 0]),
+            (Position::Center, [0xf0, 0x08, 0, 0, 0xf7, 0]),
+            (Position::Right, [0, 0xf0, 0x08, 0, 0, 0xf7]),
+        ] {
+            let raster = Raster::from_image(&source, 6, position, ImageConversion::Gray4)?;
+            assert_eq!((raster.width(), raster.height()), (6, 2));
+            assert_eq!(raster.packed(), &expected, "{position:?}");
+        }
+        let single = DynamicImage::new_luma8(1, 1);
+        let raster = Raster::from_image(&single, 2, Position::Right, ImageConversion::Gray4)?;
+        assert_eq!(raster.packed(), &[0xf0]);
+        assert!(
+            Raster::from_image(
+                &single,
+                2,
+                Position::Right,
+                ImageConversion::Mono(crate::Dither::Threshold)
+            )
+            .is_err()
+        );
         Ok(())
     }
 
     #[cfg(feature = "image")]
     #[test]
     fn dithering_is_position_independent_and_keeps_margins_white() -> Result<()> {
+        use crate::Dither;
         let source = DynamicImage::ImageLuma8(GrayImage::from_fn(3, 3, |x, y| {
             Luma([match (x + y) % 3 {
                 0 => 0,
@@ -330,13 +507,15 @@ mod tests {
             Dither::FloydSteinberg,
             Dither::Threshold,
         ] {
-            let left = Raster::from_image(&source, 8, Position::Left, dither)?;
+            let left =
+                Raster::from_image(&source, 8, Position::Left, ImageConversion::Mono(dither))?;
             for (position, offset) in [
                 (Position::Left, 0),
                 (Position::Center, 2),
                 (Position::Right, 5),
             ] {
-                let raster = Raster::from_image(&source, 8, position, dither)?;
+                let raster =
+                    Raster::from_image(&source, 8, position, ImageConversion::Mono(dither))?;
                 let preview = raster.preview();
                 for (y, (&row, &original)) in raster.packed().iter().zip(left.packed()).enumerate()
                 {

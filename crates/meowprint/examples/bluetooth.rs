@@ -1,5 +1,5 @@
 //! Print a blank row with GT01 firmware. Pass a device identifier as the first argument.
-use meowprint::{Gt01, Gt01Options, PixelFormat, bluetooth::Bluetooth};
+use meowprint::{Gt01, Gt01Options, PixelFormat, Raster, bluetooth::Bluetooth};
 use std::time::Duration;
 
 #[tokio::main]
@@ -11,13 +11,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let bluetooth = Bluetooth::new().await?;
     let device = bluetooth.find(&selector, Duration::from_secs(8)).await?;
     let mut printer = device.connect(driver).await?;
-    let result = async {
-        printer
-            .prepare(vec![0; 48], PixelFormat::Mono, &Gt01Options::default())?
-            .print()
-            .await
-    }
-    .await;
+    let width = printer.printable_width();
+    let row_bytes = (width / 8) as usize;
+    let raster = Raster::new(width, vec![0; row_bytes], PixelFormat::Mono)?;
+    let mut rows = raster.rows();
+    let result = printer.print(&mut rows, &Gt01Options::default()).await;
     let disconnected = printer.disconnect().await;
     println!("Completion evidence: {:?}", result?.completion);
     disconnected?;

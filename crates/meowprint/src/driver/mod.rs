@@ -6,11 +6,41 @@
 //! Choose a driver that matches your printer firmware. A Bluetooth name or
 //! service alone does not prove compatibility.
 //!
-//! All drivers print at a width of 384 dots. [`X6h`] and [`V5g`] also accept
-//! four-bit grayscale. The other drivers accept monochrome pixels only.
+//! All drivers print at a width of 384 dots.
 //! [`CommonRaw`], [`TinyRle`], and [`PrefixedTiny`] support firmware variants that
 //! do not have a dedicated model driver. See the [protocol reference](crate::protocol)
 //! for the known associations between models and firmware.
+//!
+//! # Supported pixel formats
+//!
+//! | Driver | [`PixelFormat::Mono`] | [`PixelFormat::Gray4`] |
+//! | --- | --- | --- |
+//! | [`Gt01`] | Yes | No |
+//! | [`Mx10`] | Yes | No |
+//! | [`CommonRaw`] | Yes | No |
+//! | [`TinyRle`] | Yes | No |
+//! | [`PrefixedTiny`] | Yes | No |
+//! | [`X6h`] | Yes | Yes |
+//! | [`V5g`] | Yes | Yes |
+//! | [`Mxw01`] | Yes | No |
+//!
+//! Query [`Driver::supports`] for pixel-format capability, then use
+//! [`Driver::validate`] to check a specific format and set of controls.
+//! A supported format may still be incompatible with a selected encoding.
+//! Both checks work without a connection or Bluetooth access.
+//!
+//! ```
+//! use meowprint::{Driver, Gt01, PixelFormat, X6h, X6hOptions};
+//!
+//! assert!(Gt01.supports(PixelFormat::Mono));
+//! assert!(!Gt01.supports(PixelFormat::Gray4));
+//! assert!(X6h.supports(PixelFormat::Gray4));
+//! X6h.validate(&X6hOptions::default(), PixelFormat::Gray4)?;
+//! # Ok::<(), meowprint::Error>(())
+//! ```
+//!
+//! The CLI's `meowprint drivers` command lists these capabilities without
+//! discovery: `grayscale true` means Mono and Gray4; `grayscale false` means Mono only.
 //!
 //! # Controls and defaults
 //!
@@ -45,17 +75,17 @@
 //! These controls use printer-specific values, not calibrated heat or speed units.
 //!
 //! [`Driver::validate`] accepts or rejects controls without contacting a printer.
-//! [`Printer::prepare`](crate::Printer::prepare) also performs this validation.
+//! [`Printer::print`](crate::Printer::print) validates them before reading rows or writing.
 
 mod common;
 pub(crate) mod framing;
 mod mxw01;
 
-use crate::session::Operation;
 use crate::{
-    Completion, DeviceInfo, PixelFormat, PrinterState, PrinterStatus, Raster, Result, Transport,
-    error::invalid,
+    Completion, DeviceInfo, PixelFormat, PrinterState, PrinterStatus, Raster, Result, RowSource,
+    Transport, error::invalid,
 };
+use crate::{session::Operation, stream::RowReader};
 use framing::{Decoder, EncodedCommand, Frame};
 use std::time::Duration;
 
@@ -96,6 +126,14 @@ pub trait Driver: Operations + Copy + 'static {
     type Options: Default + Send + Sync;
     /// Return the driver name used by the command-line tool, such as `gt01`.
     fn name(self) -> &'static str;
+    /// Return the driver's Bluetooth endpoint identifiers.
+    ///
+    /// This is advanced API for implementing a BLE backend. Ordinary callers
+    /// should use `Device::connect`; this metadata does not perform discovery
+    /// or validate a discovered service.
+    fn ble_profile(self) -> BleProfile {
+        self.settings().endpoints
+    }
     /// Return the print head width in dots.
     fn printable_width(self) -> u32 {
         self.settings().width
@@ -107,8 +145,13 @@ pub trait Driver: Operations + Copy + 'static {
     fn max_height(self) -> u32 {
         Raster::max_height(self.printable_width())
     }
-    /// Return whether packed four-bit grayscale is supported.
-    fn supports_gray4(self) -> bool;
+    /// Return whether this driver supports the given packed pixel format.
+    ///
+    /// All built-in drivers accept [`PixelFormat::Mono`]; only [`X6h`] and [`V5g`]
+    /// also accept [`PixelFormat::Gray4`]. This query requires no printer connection.
+    /// It does not check the selected controls or encoding; use [`Self::validate`]
+    /// for that combination.
+    fn supports(self, format: PixelFormat) -> bool;
     /// Determine whether the driver accepts these controls and pixel format.
     ///
     /// This method does not contact the printer or establish hardware compatibility.
@@ -168,15 +211,26 @@ pub(crate) struct Settings {
     pub pacing: Duration,
     pub finish_control_frame: bool,
     pub prefix: Option<(u8, &'static [u8])>,
-    #[cfg(feature = "bluetooth")]
-    pub endpoints: Endpoints,
+    pub endpoints: BleProfile,
 }
-#[cfg(feature = "bluetooth")]
-#[derive(Clone, Copy)]
-pub(crate) struct Endpoints {
+
+/// Bluetooth endpoint identifiers used by an advanced BLE backend.
+///
+/// All identifiers are Bluetooth-base 16-bit UUIDs. `services` lists
+/// alternatives, not a priority order or proof of compatibility. A compatible
+/// endpoint set must be found within one service; control and raster may be the
+/// same characteristic. Both writes require `WRITE_WITHOUT_RESPONSE`, and
+/// notifications require `NOTIFY`. Multiple fully compatible services are
+/// ambiguous.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BleProfile {
+    /// Alternative service UUIDs to inspect.
     pub services: &'static [u16],
+    /// Control characteristic UUID.
     pub control: u16,
+    /// Raster characteristic UUID.
     pub raster: u16,
+    /// Notification characteristic UUID.
     pub notify: u16,
 }
 impl Settings {
@@ -194,15 +248,21 @@ pub(crate) enum Movement {
 }
 /// Internal driver operations, sealed to keep wire types out of the public API.
 pub(crate) trait Operations: Sized + Send + Sync {
-    type Job: Send + Sync;
+    type Stream: Send;
     fn settings(&self) -> Settings;
     fn decoder(&self) -> Decoder;
-    fn prepare(&self, raster: &Raster, options: &<Self as Driver>::Options) -> Result<Self::Job>
+    fn stream(
+        &self,
+        height: u32,
+        format: PixelFormat,
+        options: &<Self as Driver>::Options,
+    ) -> Result<Self::Stream>
     where
         Self: Driver;
-    fn submit<T: Transport>(
+    fn submit<T: Transport, S: RowSource>(
         operation: &mut Operation<'_, T, Self>,
-        job: &Self::Job,
+        stream: &mut Self::Stream,
+        rows: &mut RowReader<'_, S>,
         submitted: &mut usize,
     ) -> impl Future<Output = Result<Completion>> + Send
     where

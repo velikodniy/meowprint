@@ -109,6 +109,36 @@ fn missing_font_fails_before_bluetooth_discovery() -> Result<(), Box<dyn std::er
     std::fs::remove_dir_all(directory)?;
     Ok(())
 }
+#[test]
+fn invalid_print_preview_path_fails_before_bluetooth_discovery()
+-> Result<(), Box<dyn std::error::Error>> {
+    let directory =
+        std::env::temp_dir().join(format!("meowprint-preview-save-{}", std::process::id()));
+    std::fs::create_dir_all(&directory)?;
+    let parent = directory.join("not-a-directory");
+    std::fs::write(&parent, [])?;
+    let output = miao()
+        .args([
+            "print",
+            "--device",
+            "not-a-printer",
+            "--driver",
+            "gt01",
+            "--preview",
+        ])
+        .arg(parent.join("preview.png"))
+        .args(["text", "Preview must be saved before discovery"])
+        .output()?;
+    assert!(!output.status.success());
+    let error = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        error.contains("Cannot save the preview. No print data was submitted."),
+        "{error}"
+    );
+    assert!(!error.contains("Finding printer"), "{error}");
+    std::fs::remove_dir_all(directory)?;
+    Ok(())
+}
 
 #[test]
 fn grayscale_preview_preserves_the_reference_levels() -> Result<(), Box<dyn std::error::Error>> {

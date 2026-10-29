@@ -1,7 +1,8 @@
-//! Record printer writes in memory with a custom transport.
+//! Record printer writes in memory with a custom transport and generated row source.
 use async_trait::async_trait;
 use meowprint::{
-    Gt01, Gt01Options, PixelFormat, Printer, Result, Transport, TransportEvent, WriteChannel,
+    Error, Gt01, Gt01Options, PixelFormat, Printer, Result, RowSource, Transport, TransportEvent,
+    WriteChannel,
 };
 
 #[derive(Default)]
@@ -21,19 +22,50 @@ impl Transport for MemoryTransport {
         Ok(())
     }
 }
-#[tokio::main]
+
+struct GeneratedRows {
+    width: u32,
+    next: u32,
+}
+impl RowSource for GeneratedRows {
+    fn width(&self) -> u32 {
+        self.width
+    }
+    fn height(&self) -> u32 {
+        8
+    }
+    fn format(&self) -> PixelFormat {
+        PixelFormat::Mono
+    }
+    fn read_row(&mut self, output: &mut [u8]) -> impl Future<Output = Result<()>> + Send {
+        if self.next >= self.height() {
+            return std::future::ready(Err(Error::InvalidInput(
+                "No generated rows remain.".into(),
+            )));
+        }
+        output.fill(0xff);
+        self.next += 1;
+        std::future::ready(Ok(()))
+    }
+}
+
+#[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
     let driver = Gt01;
     let mut printer = Printer::new(MemoryTransport::default(), driver);
     let result = async {
-        let job = printer.prepare(vec![0; 48], PixelFormat::Mono, &Gt01Options::default())?;
-        // Enable the optional image feature to inspect the prepared pixels.
-        #[cfg(feature = "image")]
-        assert_eq!(job.preview().dimensions(), (384, 1));
-        job.print().await
+        let mut rows = GeneratedRows {
+            width: printer.printable_width(),
+            next: 0,
+        };
+        printer.print(&mut rows, &Gt01Options::default()).await
     }
     .await;
     let disconnected = printer.disconnect().await;
-    assert_eq!(result?.image_rows, 1);
+    let report = result?;
+    println!(
+        "image_rows={} bytes_submitted={} completion={:?}",
+        report.image_rows, report.bytes_submitted, report.completion
+    );
     disconnected
 }

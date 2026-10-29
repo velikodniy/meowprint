@@ -4,9 +4,10 @@ use crate::driver::{
     framing::{Decoder, EncodedCommand, Frame},
 };
 use crate::{
-    Cancellation, Driver, Error, PrinterCondition, PrinterState, PrinterStatus, Result, Transport,
-    TransportEvent, WriteChannel,
+    Cancellation, Driver, Error, PrinterCondition, PrinterState, PrinterStatus, Result, RowSource,
+    Transport, TransportEvent, WriteChannel,
 };
+
 use std::time::Duration;
 use tokio::time::{Instant, timeout, timeout_at};
 
@@ -76,6 +77,7 @@ pub struct Operation<'a, T, D> {
     kind: OperationKind,
     write_attempted: bool,
     status_seen: bool,
+    source_failed: bool,
 }
 impl<T: Transport> Session<T> {
     pub(crate) fn new(transport: T, decoder: Decoder) -> Self {
@@ -118,6 +120,7 @@ impl<T: Transport> Session<T> {
             kind,
             write_attempted: false,
             status_seen: false,
+            source_failed: false,
         })
     }
     pub(crate) async fn disconnect(&mut self) -> Result<()> {
@@ -136,8 +139,9 @@ impl<T: Transport> Session<T> {
 impl<T: Transport, D: Driver> Operation<'_, T, D> {
     pub(crate) async fn finish<R>(mut self, result: Result<R>) -> Result<R> {
         self.session.expected_reply = None;
-        let safe_rejection =
-            !self.write_attempted && matches!(result, Err(Error::PrinterUnavailable(_)));
+        let safe_rejection = !self.write_attempted
+            && !self.source_failed
+            && matches!(result, Err(Error::PrinterUnavailable(_)));
         if self.kind != OperationKind::Cancel
             && !self.session.cancellation.is_cancelled()
             && (result.is_ok() || safe_rejection)
@@ -229,9 +233,52 @@ impl<T: Transport, D: Driver> Operation<'_, T, D> {
                 });
             }
         }
-        // Finish interpreting this notification before returning a fault. A later
-        // ready frame must not erase a fault, or leave the input half processed.
+        // Finish interpreting the whole notification before returning a fault.
+        // A later ready frame must not erase a fault or leave input half processed.
         failure.map_or(Ok(()), Err)
+    }
+    pub(crate) async fn read_row<S: RowSource>(
+        &mut self,
+        source: &mut S,
+        output: &mut [u8],
+    ) -> Result<()> {
+        self.cancelled()?;
+        if self
+            .session
+            .paused_since
+            .is_some_and(|since| Instant::now() >= since + PAUSE_TIMEOUT)
+        {
+            return Err(Error::Timeout("printer pause"));
+        }
+        let source_future = source.read_row(output);
+        tokio::pin!(source_future);
+        loop {
+            self.cancelled()?;
+            let pause_deadline = self.session.paused_since.map(|since| since + PAUSE_TIMEOUT);
+            if pause_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                return Err(Error::Timeout("printer pause"));
+            }
+            tokio::select! {
+                biased;
+                () = self.session.cancellation.cancelled() => return Err(Error::Cancelled),
+                () = async {
+                    if let Some(deadline) = pause_deadline {
+                        tokio::time::sleep_until(deadline).await;
+                    } else {
+                        std::future::pending::<()>().await;
+                    }
+                }, if pause_deadline.is_some() => return Err(Error::Timeout("printer pause")),
+                result = &mut source_future => {
+                    return result.inspect_err(|_| self.source_failed = true);
+                }
+                event = self.session.transport.event() => {
+                    self.handle(event?)?;
+                }
+            }
+            // Custom transports may return ready events without consuming Tokio's budget.
+            // Let tasks producing input or requesting cancellation run as well.
+            tokio::task::consume_budget().await;
+        }
     }
     async fn event_until(&mut self, deadline: Instant) -> Result<Option<TransportEvent>> {
         tokio::select! {
@@ -283,7 +330,7 @@ impl<T: Transport, D: Driver> Operation<'_, T, D> {
             }
         }
     }
-    fn chunk_size(&self) -> Result<usize> {
+    pub(crate) fn chunk_size(&self) -> Result<usize> {
         let size = self
             .session
             .transport
@@ -496,11 +543,20 @@ impl<T: Transport, D: Driver> Operation<'_, T, D> {
 mod tests {
     //! Failure-oriented tests through the public printer operations.
     use crate::{
-        Error, Gt01, PixelFormat, Printer, PrinterCondition, PrinterState, Result, Transport,
-        TransportEvent, WriteChannel,
+        Error, Gt01, PixelFormat, Printer, PrinterCondition, PrinterState, Raster, Result,
+        RowSource, Transport, TransportEvent, WriteChannel,
     };
     use async_trait::async_trait;
-    use std::{collections::VecDeque, time::Duration};
+    use std::{
+        collections::VecDeque,
+        future::{Future, poll_fn},
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+        task::Poll,
+        time::Duration,
+    };
 
     const A3_PAPER: &[u8] = &[0x51, 0x78, 0xa3, 1, 1, 0, 1, 7, 0xff];
     const AE_PAPER: &[u8] = &[0x51, 0x78, 0xae, 1, 1, 0, 1, 7, 0xff];
@@ -511,13 +567,10 @@ mod tests {
         let mut transport = Script::default();
         transport.reply(1, A3_PAPER);
         let mut printer = Printer::new(transport, Gt01);
+        let raster = Raster::new(384, vec![0xff; 48], PixelFormat::Mono)?;
+        let mut rows = raster.rows();
         let result = printer
-            .prepare(
-                vec![0xff; 48],
-                PixelFormat::Mono,
-                &crate::Gt01Options::default(),
-            )?
-            .print()
+            .print(&mut rows, &crate::Gt01Options::default())
             .await;
         assert!(
             result.is_err(),
@@ -565,10 +618,14 @@ mod tests {
     async fn print<D: crate::Driver>(
         printer: &mut Printer<Script, D>,
     ) -> Result<crate::PrintReport> {
-        printer
-            .prepare(vec![0x81; 48], PixelFormat::Mono, &D::Options::default())?
-            .print()
-            .await
+        let row_bytes = (printer.printable_width() / 8) as usize;
+        let raster = Raster::new(
+            printer.printable_width(),
+            vec![0x81; row_bytes],
+            PixelFormat::Mono,
+        )?;
+        let mut rows = raster.rows();
+        printer.print(&mut rows, &D::Options::default()).await
     }
 
     #[tokio::test(start_paused = true)]
@@ -906,13 +963,10 @@ mod tests {
             transport.reply(2, &mxw(0xa1, &status, true)?);
             transport.reply(3, &mxw(0xa9, &[start_code], true)?);
             let mut printer = Printer::new(transport, crate::Mxw01::default());
+            let raster = Raster::new(384, vec![0; 48], PixelFormat::Mono)?;
+            let mut rows = raster.rows();
             let result = printer
-                .prepare(
-                    vec![0; 48],
-                    PixelFormat::Mono,
-                    &crate::Mxw01Options::default(),
-                )?
-                .print()
+                .print(&mut rows, &crate::Mxw01Options::default())
                 .await;
             if start_code != 0 {
                 assert!(matches!(result, Err(Error::StartRejected { code: 1 })));
@@ -961,13 +1015,10 @@ mod tests {
                     },
                 };
                 let mut printer = Printer::new(transport, driver);
+                let raster = Raster::new(384, vec![0; 48], PixelFormat::Mono)?;
+                let mut rows = raster.rows();
                 let result = printer
-                    .prepare(
-                        vec![0; 48],
-                        PixelFormat::Mono,
-                        &crate::Mxw01Options::default(),
-                    )?
-                    .print()
+                    .print(&mut rows, &crate::Mxw01Options::default())
                     .await;
                 if fresh {
                     assert_eq!(result?.completion, crate::Completion::PrinterComplete);
@@ -1093,14 +1144,13 @@ mod tests {
         );
         printer.session.transport.cancel_at = Some((1, printer.cancellation()));
         assert!(matches!(
-            printer
-                .prepare(
-                    vec![0; 48],
-                    PixelFormat::Mono,
-                    &crate::Mxw01Options::default()
-                )?
-                .print()
-                .await,
+            {
+                let raster = Raster::new(384, vec![0; 48], PixelFormat::Mono)?;
+                let mut rows = raster.rows();
+                printer
+                    .print(&mut rows, &crate::Mxw01Options::default())
+                    .await
+            },
             Err(Error::Cancelled)
         ));
         let bytes: Vec<_> = printer
@@ -1258,6 +1308,346 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn pending_row_wait_observes_cancellation_printer_fault_and_disconnect() -> Result<()> {
+        let mut transport = Script::default();
+        transport.notify(Duration::from_secs(1), AE_READY);
+        let mut printer = Printer::new(transport, Gt01);
+        let cancellation = printer.cancellation();
+        let mut source = TestRows::new(1, ReadAction::Pending);
+        let operation = print_source(&mut printer, &mut source);
+        let stop = async {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            cancellation.cancel();
+        };
+        let (result, ()) = tokio::join!(operation, stop);
+        assert!(matches!(result, Err(Error::Cancelled)));
+        assert_eq!(source.reads, 1);
+        assert_eq!(printer.session.transport.writes.len(), 0);
+        assert_eq!(printer.session.transport.disconnects, 1);
+        assert!(!printer.is_usable());
+
+        let mut transport = Script::default();
+        transport.notify(Duration::from_secs(1), A3_PAPER);
+        let mut printer = Printer::new(transport, Gt01);
+        let mut source = TestRows::new(1, ReadAction::Pending);
+        assert!(matches!(
+            print_source(&mut printer, &mut source).await,
+            Err(Error::PrinterUnavailable(_))
+        ));
+        assert_eq!(source.reads, 1);
+        assert_eq!(printer.session.transport.attempts, 0);
+        assert!(printer.is_usable());
+
+        let mut transport = Script::default();
+        transport.events.push_back((
+            tokio::time::Instant::now() + Duration::from_secs(1),
+            TransportEvent::Disconnected,
+        ));
+        let mut printer = Printer::new(transport, Gt01);
+        let mut source = TestRows::new(1, ReadAction::Pending);
+        assert!(matches!(
+            print_source(&mut printer, &mut source).await,
+            Err(Error::Disconnected)
+        ));
+        assert_eq!(source.reads, 1);
+        assert_eq!(printer.session.transport.writes.len(), 0);
+        assert_eq!(printer.session.transport.disconnects, 1);
+        assert!(!printer.is_usable());
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn pending_row_future_survives_benign_notifications_and_ready_input_wins() -> Result<()> {
+        let mut transport = Script::default();
+        for index in 1..=20 {
+            transport.notify(Duration::from_millis(index * 100), AE_READY);
+        }
+        let mut printer = Printer::new(transport, Gt01);
+        let mut source = TestRows::new(1, ReadAction::Delay(Duration::from_secs(2)));
+        print_source(&mut printer, &mut source).await?;
+        assert_eq!(source.reads, 1);
+
+        let mut transport = Script::default();
+        for _ in 0..80 {
+            transport.notify(Duration::ZERO, AE_READY);
+        }
+        let mut printer = Printer::new(transport, Gt01);
+        let mut source = TestRows::new(1, ReadAction::AfterPolls(32));
+        let mut operation = printer.session.begin(Gt01, super::OperationKind::Submit)?;
+        let mut row = [0; 48];
+        let result = operation.read_row(&mut source, &mut row).await;
+        operation.finish(result).await?;
+        assert_eq!(source.reads, 1);
+        assert_eq!(source.polls.load(Ordering::Relaxed), 32);
+        assert_eq!(row, [0xff; 48]);
+        assert_ne!(printer.session.transport.events.len(), 0);
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn source_wait_yields_to_scheduled_cancellation() -> Result<()> {
+        let mut printer = Printer::new(ready_notification_burst(), Gt01);
+        let cancellation = printer.cancellation();
+        let mut source = TestRows::new(1, ReadAction::Pending);
+        let mut operation = printer.session.begin(Gt01, super::OperationKind::Submit)?;
+        let stop = tokio::spawn(async move { cancellation.cancel() });
+        let result = operation.read_row(&mut source, &mut [0; 48]).await;
+        let result = operation.finish(result).await;
+        assert!(stop.await.is_ok());
+        assert!(matches!(result, Err(Error::Cancelled)));
+        assert_eq!(source.reads, 1);
+        assert!(!printer.session.transport.events.is_empty());
+        assert_eq!(printer.session.transport.writes, []);
+        assert_eq!(printer.session.transport.disconnects, 1);
+        assert!(!printer.is_usable());
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn source_wait_yields_to_scheduled_input() -> Result<()> {
+        let signal = Arc::new(tokio::sync::Notify::new());
+        let mut source = TestRows::new(1, ReadAction::Signal(Arc::clone(&signal)));
+        let mut printer = Printer::new(ready_notification_burst(), Gt01);
+        let mut operation = printer.session.begin(Gt01, super::OperationKind::Submit)?;
+        let producer = tokio::spawn(async move { signal.notify_one() });
+        let mut row = [0; 48];
+        let result = operation.read_row(&mut source, &mut row).await;
+        operation.finish(result).await?;
+        assert!(producer.await.is_ok());
+        assert_eq!(source.reads, 1);
+        assert_eq!(row, [0xff; 48]);
+        assert!(!printer.session.transport.events.is_empty());
+        assert_eq!(printer.session.transport.writes, []);
+        assert_eq!(printer.session.transport.disconnects, 0);
+        assert!(printer.is_usable());
+        Ok(())
+    }
+
+    fn ready_notification_burst() -> Script {
+        let mut transport = Script {
+            immediate_events: true,
+            ..Script::default()
+        };
+        for _ in 0..1024 {
+            transport.notify(Duration::ZERO, AE_READY);
+        }
+        // Without yielding, the read reaches this sentinel instead of hanging the test.
+        transport
+            .events
+            .push_back((tokio::time::Instant::now(), TransportEvent::Disconnected));
+        transport
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn unpaused_source_can_take_longer_than_thirty_seconds() -> Result<()> {
+        let mut printer = Printer::new(Script::default(), Gt01);
+        let mut source = TestRows::new(1, ReadAction::Delay(Duration::from_secs(31)));
+        let started = tokio::time::Instant::now();
+        print_source(&mut printer, &mut source).await?;
+        assert!(tokio::time::Instant::now() - started >= Duration::from_secs(31));
+        assert_eq!(source.reads, 1);
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn source_owned_deadline_propagates_and_disables_connection() -> Result<()> {
+        let mut printer = Printer::new(Script::default(), Gt01);
+        let mut source = TestRows::new(1, ReadAction::InputDeadline(Duration::from_secs(2)));
+        let started = tokio::time::Instant::now();
+        assert!(matches!(
+            print_source(&mut printer, &mut source).await,
+            Err(Error::Timeout("source input"))
+        ));
+        assert_eq!(
+            tokio::time::Instant::now() - started,
+            Duration::from_secs(2)
+        );
+        assert_eq!(source.reads, 1);
+        assert_eq!(printer.session.transport.attempts, 0);
+        assert!(!printer.is_usable());
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn source_failure_disables_before_and_after_output_and_preserves_primary_error()
+    -> Result<()> {
+        let mut printer = Printer::new(Script::default(), Gt01);
+        let mut source = TestRows::new(1, ReadAction::Fill);
+        source.fail_at = Some((1, SourceFailure::Timeout));
+        assert!(matches!(
+            print_source(&mut printer, &mut source).await,
+            Err(Error::Timeout("source input"))
+        ));
+        assert_eq!(printer.session.transport.writes.len(), 0);
+        assert_eq!(printer.session.transport.disconnects, 1);
+        assert!(!printer.is_usable());
+
+        let mut printer = Printer::new(Script::default(), Gt01);
+        let mut source = TestRows::new(2, ReadAction::Fill);
+        source.fail_at = Some((2, SourceFailure::Timeout));
+        assert!(matches!(
+            print_source(&mut printer, &mut source).await,
+            Err(Error::Timeout("source input"))
+        ));
+        assert_eq!(source.reads, 2);
+        assert!(printer.session.transport.attempts > 0);
+        assert_eq!(printer.session.transport.disconnects, 1);
+        assert!(!printer.is_usable());
+
+        let mut printer = Printer::new(
+            Script {
+                fail_disconnect: true,
+                ..Script::default()
+            },
+            Gt01,
+        );
+        let mut source = TestRows::new(1, ReadAction::Fill);
+        source.fail_at = Some((1, SourceFailure::Timeout));
+        assert!(matches!(
+            print_source(&mut printer, &mut source).await,
+            Err(Error::Timeout("source input"))
+        ));
+        assert_eq!(printer.session.transport.disconnects, 1);
+        assert!(!printer.is_usable());
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn source_cannot_spoof_a_safe_printer_unavailable_rejection() -> Result<()> {
+        let mut printer = Printer::new(Script::default(), Gt01);
+        let mut source = TestRows::new(1, ReadAction::Fill);
+        source.fail_at = Some((1, SourceFailure::PrinterUnavailable));
+        assert!(matches!(
+            print_source(&mut printer, &mut source).await,
+            Err(Error::PrinterUnavailable(PrinterState::Conditions(_)))
+        ));
+        assert_eq!(printer.session.transport.attempts, 0);
+        assert_eq!(printer.session.transport.disconnects, 1);
+        assert!(!printer.is_usable());
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn repeated_pause_notifications_do_not_extend_pending_row_deadline() -> Result<()> {
+        let mut transport = Script::default();
+        transport.notify(Duration::from_secs(1), AE_PAUSE);
+        for seconds in [6, 11, 15] {
+            transport.notify(Duration::from_secs(seconds), AE_PAUSE);
+        }
+        transport.notify(Duration::from_secs(16), AE_READY);
+        let mut printer = Printer::new(transport, Gt01);
+        let mut source = TestRows::new(1, ReadAction::Delay(Duration::from_secs(16)));
+        let started = tokio::time::Instant::now();
+        assert!(matches!(
+            print_source(&mut printer, &mut source).await,
+            Err(Error::Timeout("printer pause"))
+        ));
+        assert_eq!(
+            tokio::time::Instant::now() - started,
+            Duration::from_secs(16)
+        );
+        assert_eq!(source.reads, 1);
+        assert_eq!(printer.session.transport.attempts, 0);
+        assert!(!printer.is_usable());
+        Ok(())
+    }
+
+    async fn print_source<D: crate::Driver>(
+        printer: &mut Printer<Script, D>,
+        source: &mut TestRows,
+    ) -> Result<crate::PrintReport> {
+        printer.print(source, &D::Options::default()).await
+    }
+
+    #[derive(Clone)]
+    enum ReadAction {
+        Fill,
+        Delay(Duration),
+        InputDeadline(Duration),
+        Pending,
+        AfterPolls(usize),
+        Signal(Arc<tokio::sync::Notify>),
+    }
+    #[derive(Clone, Copy)]
+    enum SourceFailure {
+        Timeout,
+        PrinterUnavailable,
+    }
+    struct TestRows {
+        height: u32,
+        action: ReadAction,
+        fail_at: Option<(usize, SourceFailure)>,
+        reads: usize,
+        polls: Arc<AtomicUsize>,
+    }
+    impl TestRows {
+        fn new(height: u32, action: ReadAction) -> Self {
+            Self {
+                height,
+                action,
+                fail_at: None,
+                reads: 0,
+                polls: Arc::new(AtomicUsize::new(0)),
+            }
+        }
+    }
+    impl RowSource for TestRows {
+        fn width(&self) -> u32 {
+            384
+        }
+        fn height(&self) -> u32 {
+            self.height
+        }
+        fn format(&self) -> PixelFormat {
+            PixelFormat::Mono
+        }
+        fn read_row(&mut self, output: &mut [u8]) -> impl Future<Output = Result<()>> + Send {
+            self.reads += 1;
+            let read = self.reads;
+            let action = self.action.clone();
+            let failure = self.fail_at.filter(|(at, _)| *at == read).map(|(_, e)| e);
+            let polls = Arc::clone(&self.polls);
+            async move {
+                match action {
+                    ReadAction::Fill => {}
+                    ReadAction::Delay(duration) => tokio::time::sleep(duration).await,
+                    ReadAction::InputDeadline(duration) => {
+                        tokio::time::timeout(duration, std::future::pending::<()>())
+                            .await
+                            .map_err(|_| Error::Timeout("source input"))?;
+                    }
+                    ReadAction::Pending => std::future::pending::<()>().await,
+                    ReadAction::Signal(signal) => signal.notified().await,
+                    ReadAction::AfterPolls(limit) => {
+                        poll_fn(|cx| {
+                            let count = polls.fetch_add(1, Ordering::Relaxed) + 1;
+                            if count >= limit {
+                                Poll::Ready(())
+                            } else {
+                                cx.waker().wake_by_ref();
+                                Poll::Pending
+                            }
+                        })
+                        .await;
+                    }
+                }
+                if let Some(failure) = failure {
+                    return Err(match failure {
+                        SourceFailure::Timeout => Error::Timeout("source input"),
+                        SourceFailure::PrinterUnavailable => {
+                            Error::PrinterUnavailable(PrinterState::Conditions(vec![
+                                PrinterCondition::OutOfPaper,
+                            ]))
+                        }
+                    });
+                }
+                output.fill(0xff);
+                Ok(())
+            }
+        }
+    }
+
     /// Scheduled notifications and injected transport failures, without protocol emulation.
     struct Script {
         writes: Vec<(WriteChannel, Vec<u8>)>,
@@ -1272,6 +1662,7 @@ mod tests {
         cancel_at: Option<(usize, crate::Cancellation)>,
         responses: std::collections::BTreeMap<usize, Vec<(std::time::Duration, TransportEvent)>>,
         events: VecDeque<(tokio::time::Instant, TransportEvent)>,
+        immediate_events: bool,
     }
     impl Default for Script {
         fn default() -> Self {
@@ -1288,6 +1679,7 @@ mod tests {
                 cancel_at: None,
                 responses: std::collections::BTreeMap::default(),
                 events: VecDeque::new(),
+                immediate_events: false,
             }
         }
     }
@@ -1337,7 +1729,9 @@ mod tests {
         }
         async fn event(&mut self) -> Result<TransportEvent> {
             if let Some((at, _)) = self.events.front() {
-                tokio::time::sleep_until(*at).await;
+                if !self.immediate_events {
+                    tokio::time::sleep_until(*at).await;
+                }
                 if let Some((_, event)) = self.events.pop_front() {
                     return Ok(event);
                 }

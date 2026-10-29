@@ -11,10 +11,8 @@
 //! Implement [`Transport`] only when your application needs a different connection
 //! backend or a simulated printer.
 
-pub use crate::job::PrintJob;
-
 use crate::{
-    DeviceInfo, Driver, PixelFormat, PrinterStatus, Raster, Result,
+    DeviceInfo, Driver, PixelFormat, PrinterStatus, Result,
     session::{OperationKind, Session},
 };
 use async_trait::async_trait;
@@ -104,32 +102,33 @@ pub trait Transport: Send {
     async fn disconnect(&mut self) -> Result<()>;
 }
 
-/// A transport for offline preparation and previews, with no connection or I/O.
+/// A forward-only source of packed image rows.
 ///
-/// Pass it to [`Printer::new`] with the selected driver. Preparation and preview
-/// work without Bluetooth access or a Tokio runtime. Writes and event reads
-/// return [`crate::Error::Transport`], so an attempted print cannot report success.
-/// Disconnecting succeeds without doing anything.
-#[derive(Debug, Default, Clone, Copy)]
-pub struct NoOpTransport;
-
-#[async_trait]
-impl Transport for NoOpTransport {
-    async fn write(&mut self, _: WriteChannel, _: &[u8]) -> Result<()> {
-        Err(crate::Error::Transport(
-            "Offline transport cannot write to a printer.".into(),
-        ))
-    }
-
-    async fn event(&mut self) -> Result<TransportEvent> {
-        Err(crate::Error::Transport(
-            "Offline transport cannot receive printer events.".into(),
-        ))
-    }
-
-    async fn disconnect(&mut self) -> Result<()> {
-        Ok(())
-    }
+/// Metadata must remain fixed during submission. Rows run top to bottom and use
+/// [`PixelFormat`]'s darkness polarity and bit/nibble order. Source methods must
+/// not perform printer I/O, and need not retain previously supplied rows.
+///
+/// A successful [`Printer::print`] requests exactly [`Self::height`] rows, with
+/// no EOF probe. Document framing, trailing data, and input deadlines belong to
+/// the source or its caller. Without a source deadline, a row can remain pending
+/// until cancellation or a printer fault. Abandoning printing may drop its future.
+pub trait RowSource: Send {
+    /// Return the fixed width in dots.
+    fn width(&self) -> u32;
+    /// Return the exact number of image rows to submit.
+    fn height(&self) -> u32;
+    /// Return the packed pixel format.
+    fn format(&self) -> PixelFormat;
+    /// Fill the entire destination with the next packed row.
+    ///
+    /// The destination contains width/8 bytes for Mono or width/2 for Gray4.
+    /// One future is retained while benign printer events are handled.
+    ///
+    /// # Errors
+    /// Return an error if the requested row cannot be supplied. Destination
+    /// contents after an error are ignored; the connection is disabled even
+    /// when no print bytes have yet been sent. Earlier rows may already print.
+    fn read_row(&mut self, output: &mut [u8]) -> impl Future<Output = Result<()>> + Send;
 }
 
 /// A shared handle that requests cancellation of a [`Printer`] operation.
@@ -221,9 +220,11 @@ pub struct PrintReport {
 /// [`Transport`] to [`Self::new`]. Run prints, queries, and paper movement one at a time.
 /// All asynchronous operations require a Tokio runtime.
 ///
-/// [`Self::prepare`] creates a job that borrows this printer until printed or dropped.
-/// Pass `&Default::default()` to use driver defaults.
-/// An input or compression error at this stage leaves the connection usable.
+/// [`Self::print`] borrows this printer, its row source, and its controls until
+/// submission settles. Pass `&Default::default()` for driver defaults.
+/// Invalid metadata or controls leave the connection usable without reading rows.
+/// Source or compression errors after submission begins disable the connection,
+/// even before the first write; later errors may leave partial physical output.
 /// After a successful print, query, or paper movement, you can reuse this printer.
 ///
 /// Communication failures and dropping an active operation disable further use.
@@ -241,7 +242,7 @@ impl<T: Transport, D: Driver> Printer<T, D> {
     ///
     /// This constructor does not connect, subscribe, or send printer commands.
     /// For communication, connect and subscribe the transport first as described
-    /// by [`Transport`]. For offline preparation, use [`NoOpTransport`].
+    /// by [`Transport`]. Offline pixel conversion and preview use [`crate::Raster`].
     #[must_use]
     pub fn new(transport: T, driver: D) -> Self {
         Self {
@@ -270,83 +271,6 @@ impl<T: Transport, D: Driver> Printer<T, D> {
     #[must_use]
     pub fn is_usable(&self) -> bool {
         self.session.is_usable()
-    }
-    /// Prepare packed pixels for this printer without sending any bytes.
-    ///
-    /// This method takes ownership of `bytes`. The pixel format and byte count
-    /// determine the height. Rows must fill [`Self::printable_width`] dots without padding.
-    /// [`PixelFormat`] describes the pixel order and darkness values.
-    ///
-    /// Pass `&Default::default()` to use driver defaults. See the [driver reference](crate::driver)
-    /// for supported controls. An optional density of `None` keeps the existing
-    /// printer density. The job copies the controls, so later changes to `options`
-    /// do not affect it.
-    ///
-    /// The returned [`PrintJob`] borrows this printer exclusively. Call
-    /// [`PrintJob::print`] to submit it, or drop it to release the printer without printing.
-    /// With the `image` feature, the job also provides a preview of its pixels.
-    ///
-    /// Images must contain complete rows, with a height from 1 through
-    /// [`Driver::max_height`] rows. Preparation validates and compresses the image
-    /// before returning. It needs no Tokio runtime.
-    ///
-    /// # Errors
-    /// Return [`crate::Error::InvalidInput`] for incomplete rows, unsupported formats,
-    /// invalid controls, or an empty or oversized image. Input and compression
-    /// errors leave the connection usable.
-    /// A previously disabled connection returns [`crate::Error::UnusableConnection`].
-    pub fn prepare(
-        &mut self,
-        bytes: Vec<u8>,
-        format: PixelFormat,
-        options: &D::Options,
-    ) -> Result<PrintJob<'_, T, D>> {
-        self.session.ensure_usable()?;
-        let raster = Raster::new(self.printable_width(), bytes, format)?;
-        let job = self.driver.prepare(&raster, options)?;
-        let image_rows = raster.height();
-        Ok(PrintJob {
-            printer: self,
-            job,
-            image_rows,
-            #[cfg(feature = "image")]
-            raster,
-        })
-    }
-    /// Prepare an image as monochrome pixels without sending any bytes.
-    ///
-    /// Available with the `image` feature. The image keeps its size.
-    /// Resize it to at most [`Self::printable_width`] dots before calling this
-    /// method. [`crate::Position`] sets the horizontal position on white paper.
-    /// Transparency is combined with a white background before applying [`crate::Dither`].
-    /// Dithering never changes the white margins.
-    ///
-    /// Use [`crate::Dither::Threshold`] for an image that is already black and
-    /// white. [`crate::Dither::default`] selects Ostromoukhov diffusion.
-    /// This method always produces [`PixelFormat::Mono`], even on a printer
-    /// that supports grayscale. Use [`Self::prepare`] for packed grayscale.
-    ///
-    /// The job borrows only the printer. Later changes to the source image or
-    /// options do not affect it. Preparation needs no Tokio runtime.
-    /// [`PrintJob::preview`] returns the exact positioned, dithered pixels.
-    ///
-    /// # Errors
-    /// Reject an empty image, an image wider than the print head, or a height
-    /// above [`Driver::max_height`]. Invalid controls and compression errors also
-    /// leave the connection usable. A disabled connection returns
-    /// [`crate::Error::UnusableConnection`].
-    #[cfg(feature = "image")]
-    pub fn prepare_from_image(
-        &mut self,
-        image: &image::DynamicImage,
-        position: crate::Position,
-        dither: crate::Dither,
-        options: &D::Options,
-    ) -> Result<PrintJob<'_, T, D>> {
-        self.session.ensure_usable()?;
-        self.driver.validate(options, PixelFormat::Mono)?;
-        let raster = Raster::from_image(image, self.printable_width(), position, dither)?;
-        self.prepare(raster.into_packed(), PixelFormat::Mono, options)
     }
 
     /// Move paper forward by the requested number of dot rows.

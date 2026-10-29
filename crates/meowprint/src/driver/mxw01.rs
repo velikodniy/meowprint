@@ -1,12 +1,11 @@
 //! The MXW01 firmware driver, controls, and protocol behavior.
-#[cfg(feature = "bluetooth")]
-use super::Endpoints;
 use super::framing::{Decoder, EncodedCommand, Frame, encode};
-use super::{Observation, Operations, Settings};
+use super::{BleProfile, Observation, Operations, Settings};
 use crate::session::{Operation, REPLY_TIMEOUT, ReplyKind};
+use crate::stream::RowReader;
 use crate::{
     Completion, DeviceInfo, Driver, Error, PixelFormat, PrinterCondition, PrinterState,
-    PrinterStatus, Raster, Result, Transport, WriteChannel, error::invalid,
+    PrinterStatus, Result, RowSource, Transport, WriteChannel, error::invalid,
 };
 use std::time::Duration;
 
@@ -45,21 +44,28 @@ impl Default for Mxw01Options {
         Self { intensity: 0x5d }
     }
 }
-pub struct Job {
-    data: Vec<u8>,
+pub struct Stream {
     intensity: EncodedCommand,
     status: EncodedCommand,
     start: EncodedCommand,
     flush: EncodedCommand,
+    total_rows: u16,
+    height: u32,
+    row: [u8; 48],
+    chunk: [u8; MAX_CHUNK_SIZE],
 }
 const MAX_PAYLOAD: usize = 255;
+const MAX_CHUNK_SIZE: usize = 120;
 impl Driver for Mxw01 {
     type Options = Mxw01Options;
     fn name(self) -> &'static str {
         "mxw01"
     }
-    fn supports_gray4(self) -> bool {
-        false
+    fn supports(self, format: PixelFormat) -> bool {
+        match format {
+            PixelFormat::Mono => true,
+            PixelFormat::Gray4 => false,
+        }
     }
     fn validate(self, _options: &Mxw01Options, format: PixelFormat) -> Result<()> {
         if format != PixelFormat::Mono {
@@ -69,16 +75,15 @@ impl Driver for Mxw01 {
     }
 }
 impl Operations for Mxw01 {
-    type Job = Job;
+    type Stream = Stream;
     fn settings(&self) -> Settings {
         Settings {
             width: 384,
-            chunk_size: 120,
+            chunk_size: MAX_CHUNK_SIZE,
             pacing: Duration::from_millis(25),
             finish_control_frame: true,
             prefix: None,
-            #[cfg(feature = "bluetooth")]
-            endpoints: Endpoints {
+            endpoints: BleProfile {
                 services: &[0xae30, 0xaf30],
                 control: 0xae01,
                 raster: 0xae03,
@@ -93,35 +98,42 @@ impl Operations for Mxw01 {
             self.reply_format == ReplyFormat::WithCrc,
         )
     }
-    fn prepare(&self, raster: &Raster, options: &Mxw01Options) -> Result<Job> {
-        self.validate(options, raster.format())?;
-        let total_rows = u16::try_from(raster.height() + 2)
-            .map_err(|_| invalid("The padded raster exceeds the 16-bit row count."))?
-            .max(90);
-        let mut data = vec![0; raster.row_bytes()];
-        data.extend_from_slice(raster.packed());
-        data.resize(usize::from(total_rows) * raster.row_bytes(), 0);
-        Ok(Job {
-            data,
+    fn stream(&self, height: u32, format: PixelFormat, options: &Mxw01Options) -> Result<Stream> {
+        self.validate(options, format)?;
+        let total_rows = u16::try_from(
+            height
+                .checked_add(2)
+                .ok_or_else(|| invalid("The padded raster exceeds the 16-bit row count."))?,
+        )
+        .map_err(|_| invalid("The padded raster exceeds the 16-bit row count."))?
+        .max(90);
+        Ok(Stream {
             intensity: Command::Intensity(options.intensity).prepare(MAX_PAYLOAD)?,
             status: Command::Query(Query::Status).prepare(MAX_PAYLOAD)?,
             start: Command::Start(total_rows).prepare(MAX_PAYLOAD)?,
             flush: Command::Flush.prepare(MAX_PAYLOAD)?,
+            total_rows,
+            height,
+            row: [0; 48],
+            chunk: [0; MAX_CHUNK_SIZE],
         })
     }
-    async fn submit<T: Transport>(
+    async fn submit<T: Transport, S: RowSource>(
         operation: &mut Operation<'_, T, Self>,
-        job: &Job,
+        stream: &mut Stream,
+        rows: &mut RowReader<'_, S>,
         submitted: &mut usize,
     ) -> Result<Completion> {
-        operation.send_command(&job.intensity, submitted).await?;
-        let status = operation.request_status(&job.status, submitted).await?;
+        let chunk_size = operation.chunk_size()?;
+        rows.fill(operation, &mut stream.row).await?;
+        operation.send_command(&stream.intensity, submitted).await?;
+        let status = operation.request_status(&stream.status, submitted).await?;
         if status.state != PrinterState::Ready {
             return Err(Error::PrinterUnavailable(status.state));
         }
         let start = operation
             .exchange(
-                &job.start,
+                &stream.start,
                 ReplyKind::Command(0xa9),
                 REPLY_TIMEOUT,
                 submitted,
@@ -133,12 +145,52 @@ impl Operations for Mxw01 {
             Some(flag) => return Err(Error::StartRejected { code: flag }),
             None => return Err(Error::InvalidReply("MXW01 start")),
         }
-        operation
-            .send(WriteChannel::Raster, &job.data, submitted)
+        let mut used = 0usize;
+        append_chunk(
+            operation,
+            &mut stream.chunk[..chunk_size],
+            &mut used,
+            &[0; 48],
+            submitted,
+        )
+        .await?;
+        append_chunk(
+            operation,
+            &mut stream.chunk[..chunk_size],
+            &mut used,
+            &stream.row,
+            submitted,
+        )
+        .await?;
+        for _ in 1..stream.height {
+            rows.fill(operation, &mut stream.row).await?;
+            append_chunk(
+                operation,
+                &mut stream.chunk[..chunk_size],
+                &mut used,
+                &stream.row,
+                submitted,
+            )
             .await?;
+        }
+        for _ in 0..(usize::from(stream.total_rows) - stream.height as usize - 1) {
+            append_chunk(
+                operation,
+                &mut stream.chunk[..chunk_size],
+                &mut used,
+                &[0; 48],
+                submitted,
+            )
+            .await?;
+        }
+        if used != 0 {
+            operation
+                .send(WriteChannel::Raster, &stream.chunk[..used], submitted)
+                .await?;
+        }
         operation
             .exchange(
-                &job.flush,
+                &stream.flush,
                 ReplyKind::Command(0xaa),
                 Duration::from_secs(30),
                 submitted,
@@ -191,6 +243,28 @@ impl Operations for Mxw01 {
         Command::Cancel.prepare(MAX_PAYLOAD).map(Some)
     }
 }
+async fn append_chunk<T: Transport>(
+    operation: &mut Operation<'_, T, Mxw01>,
+    chunk: &mut [u8],
+    used: &mut usize,
+    bytes: &[u8; 48],
+    submitted: &mut usize,
+) -> Result<()> {
+    let mut offset = 0;
+    while offset < bytes.len() {
+        let count = (chunk.len() - *used).min(bytes.len() - offset);
+        chunk[*used..*used + count].copy_from_slice(&bytes[offset..offset + count]);
+        *used += count;
+        offset += count;
+        if *used == chunk.len() {
+            operation
+                .send(WriteChannel::Raster, chunk, submitted)
+                .await?;
+            *used = 0;
+        }
+    }
+    Ok(())
+}
 
 const HEADER: [u8; 2] = [0x22, 0x21];
 
@@ -232,7 +306,7 @@ impl Query {
 /// One outgoing MXW01 control command, encoded by `prepare`.
 ///
 /// These commands do not contain image bytes. MXW01 sends raw monochrome pixels
-/// through [`WriteChannel::Raster`](crate::WriteChannel::Raster) after the printer
+/// through [`WriteChannel::Raster`] after the printer
 /// accepts the start command. [`Printer`](crate::Printer) supplies this sequence.
 /// Encoding alone does not send commands or wait for replies.
 #[derive(Debug, Clone, Copy)]

@@ -1,13 +1,14 @@
 //! Commands, controls, queries, and submission for the common wire family.
-#[cfg(feature = "bluetooth")]
-use super::Endpoints;
-use super::framing::{Decoder, EncodedCommand, Frame, encode};
-use super::{Flow, Movement, Observation, Operations, RasterEncoding, Settings};
+use super::framing::{Decoder, EncodedCommand, Frame, encode, finish_into};
+use super::{BleProfile, Flow, Movement, Observation, Operations, RasterEncoding, Settings};
 use crate::session::{Operation, REPLY_TIMEOUT, ReplyKind};
+use crate::stream::RowReader;
 use crate::{
     Completion, DeviceInfo, Driver, Error, PixelFormat, PrinterCondition, PrinterState,
-    PrinterStatus, Raster, Result, Transport, WriteChannel, encoding, error::invalid,
+    PrinterStatus, Result, RowSource, Transport, WriteChannel, encoding, error::invalid,
 };
+use flate2::{Compress, Compression};
+use lzokay::compress::Dict;
 use std::time::Duration;
 
 /// Monochrome compression choices for [`Gt01`], [`TinyRle`], and [`PrefixedTiny`].
@@ -129,8 +130,7 @@ impl Spec {
             pacing: Duration::from_millis(self.pacing_ms),
             finish_control_frame: false,
             prefix: self.prefix,
-            #[cfg(feature = "bluetooth")]
-            endpoints: Endpoints {
+            endpoints: BleProfile {
                 services: &[0xae30, 0xaf30],
                 control: 0xae01,
                 raster: 0xae01,
@@ -208,8 +208,8 @@ impl Spec {
             self.feed(rows, false)
         }
     }
-    fn prepare(self, raster: &Raster, options: &Controls) -> Result<Job> {
-        let encoding = self.validate(options, raster.format())?;
+    fn stream(self, format: PixelFormat, options: &Controls) -> Result<Stream> {
+        let encoding = self.validate(options, format)?;
         let mut start = Vec::new();
         if self.density_first
             && let Some(density) = options.density
@@ -227,9 +227,7 @@ impl Spec {
         }
         start.push(Command::Energy(options.energy));
         start.push(
-            if matches!(self.quality, Quality::Concentration)
-                && raster.format() == PixelFormat::Gray4
-            {
+            if matches!(self.quality, Quality::Concentration) && format == PixelFormat::Gray4 {
                 Command::GrayscaleMode(options.mode)
             } else {
                 Command::Mode(options.mode)
@@ -241,10 +239,9 @@ impl Spec {
         {
             start.push(Command::Density(density));
         }
-        let feed_speed = options.feed_speed;
         let mut end = Vec::new();
         if self.end_speed {
-            end.push(Command::Speed(feed_speed));
+            end.push(Command::Speed(options.feed_speed));
         }
         if self.lattice {
             end.push(Command::LatticeEnd);
@@ -253,59 +250,61 @@ impl Spec {
             Command::Query(Query::State),
             self.end_queries,
         ));
-        let band_rows = if encoding == RasterEncoding::LzoBands {
-            20
-        } else {
-            1
-        };
-        Ok(Job {
+        let row_bytes = 384 / if format == PixelFormat::Mono { 8 } else { 2 };
+        let mut encoder = RowEncoder::new(format, row_bytes, encoding, self.max_payload)?;
+        let blank = encoder.encode(1)?.to_vec();
+        Ok(Stream {
             start: self.commands(start)?,
-            before_feed: self.commands(vec![Command::Speed(feed_speed)])?,
+            before_feed: self.commands(vec![Command::Speed(options.feed_speed)])?,
             feed: self.feed(options.feed, matches!(self.feed, Feed::Split))?,
             end: self.commands(end)?,
-            frames: raster
-                .packed()
-                .chunks(raster.row_bytes() * band_rows)
-                .map(|raw| row_frame(raw, raster.format(), encoding, self.max_payload))
-                .collect::<Result<_>>()?,
-            blank: row_frame(
-                &vec![0; raster.row_bytes()],
-                raster.format(),
-                encoding,
-                self.max_payload,
-            )?,
+            blank,
+            encoder,
         })
     }
 }
-pub struct Job {
+pub struct Stream {
     start: Vec<EncodedCommand>,
     before_feed: Vec<EncodedCommand>,
     feed: Movement,
     end: Vec<EncodedCommand>,
-    frames: Vec<Vec<u8>>,
     blank: Vec<u8>,
+    encoder: RowEncoder,
 }
-async fn submit<T: Transport, D: Driver>(
+async fn submit<T: Transport, D: Driver, S: RowSource>(
     operation: &mut Operation<'_, T, D>,
-    job: &Job,
+    stream: &mut Stream,
+    rows: &mut RowReader<'_, S>,
     submitted: &mut usize,
 ) -> Result<Completion> {
     operation.wait_ready().await?;
-    operation.send_commands(&job.start, submitted).await?;
+    let count = rows.fill(operation, stream.encoder.input_mut()).await?;
+    let frame = stream.encoder.encode(count)?;
+    operation.send_commands(&stream.start, submitted).await?;
     operation
-        .send(WriteChannel::Control, &job.blank, submitted)
+        .send(WriteChannel::Control, &stream.blank, submitted)
         .await?;
-    for frame in &job.frames {
+    operation
+        .send(WriteChannel::Control, frame, submitted)
+        .await?;
+    loop {
+        let count = rows.fill(operation, stream.encoder.input_mut()).await?;
+        if count == 0 {
+            break;
+        }
+        let frame = stream.encoder.encode(count)?;
         operation
             .send(WriteChannel::Control, frame, submitted)
             .await?;
     }
     operation
-        .send(WriteChannel::Control, &job.blank, submitted)
+        .send(WriteChannel::Control, &stream.blank, submitted)
         .await?;
-    operation.send_commands(&job.before_feed, submitted).await?;
-    operation.send_movement(&job.feed, submitted).await?;
-    let marker = operation.send_commands(&job.end, submitted).await?;
+    operation
+        .send_commands(&stream.before_feed, submitted)
+        .await?;
+    operation.send_movement(&stream.feed, submitted).await?;
+    let marker = operation.send_commands(&stream.end, submitted).await?;
     operation.bounded_drain().await?;
     Ok(if operation.ready_after(marker) {
         Completion::ReadyAfterEnd
@@ -375,34 +374,132 @@ fn common_state(flags: u8) -> PrinterState {
     PrinterState::Conditions(conditions)
 }
 
-fn row_frame(
-    raw: &[u8],
+enum Codec {
+    Raw,
+    Rle,
+    Lzo(Box<Dict>),
+    Zlib(Compress),
+}
+
+struct RowEncoder {
     format: PixelFormat,
-    encoding: RasterEncoding,
-    limit: usize,
-) -> Result<Vec<u8>> {
-    match encoding {
-        RasterEncoding::Raw => Command::RawRow(raw).encode(limit),
-        RasterEncoding::Rle => {
-            let packed = encoding::rle(raw);
-            if packed.len() > raw.len() {
-                Command::RawRow(raw).encode(limit)
-            } else {
-                Command::RleRow(&packed).encode(limit)
-            }
+    row_bytes: usize,
+    max_payload: usize,
+    input: Vec<u8>,
+    frame: Vec<u8>,
+    codec: Codec,
+}
+
+impl RowEncoder {
+    fn new(
+        format: PixelFormat,
+        row_bytes: usize,
+        encoding: RasterEncoding,
+        max_payload: usize,
+    ) -> Result<Self> {
+        let band_rows = if encoding == RasterEncoding::LzoBands {
+            20
+        } else {
+            1
+        };
+        let compressed = matches!(
+            encoding,
+            RasterEncoding::Lzo | RasterEncoding::LzoBands | RasterEncoding::ZlibExperimental
+        );
+        let payload_capacity = if compressed { max_payload } else { row_bytes };
+        if payload_capacity > max_payload || (compressed && max_payload < 4) {
+            return Err(invalid(
+                "The frame exceeds the selected driver payload limit.",
+            ));
         }
-        RasterEncoding::Lzo | RasterEncoding::LzoBands | RasterEncoding::ZlibExperimental => {
-            let payload = if encoding == RasterEncoding::ZlibExperimental {
-                encoding::zlib_payload(raw)?
-            } else {
-                encoding::lzo_payload(raw)?
-            };
-            match format {
-                PixelFormat::Mono => Command::CompressedMono(&payload),
-                PixelFormat::Gray4 => Command::CompressedGray(&payload),
+        let codec = match encoding {
+            RasterEncoding::Raw => Codec::Raw,
+            RasterEncoding::Rle => Codec::Rle,
+            RasterEncoding::Lzo | RasterEncoding::LzoBands => Codec::Lzo(Dict::new()),
+            RasterEncoding::ZlibExperimental => {
+                Codec::Zlib(Compress::new(Compression::default(), true))
             }
-            .encode(limit)
+        };
+        Ok(Self {
+            format,
+            row_bytes,
+            max_payload,
+            input: if matches!(codec, Codec::Raw) {
+                Vec::new()
+            } else {
+                vec![0; row_bytes * band_rows]
+            },
+            frame: vec![0; payload_capacity + 8],
+            codec,
+        })
+    }
+
+    fn input_mut(&mut self) -> &mut [u8] {
+        if matches!(self.codec, Codec::Raw) {
+            &mut self.frame[6..6 + self.row_bytes]
+        } else {
+            &mut self.input
         }
+    }
+
+    fn encode(&mut self, rows: usize) -> Result<&[u8]> {
+        let raw_len = self.row_bytes * rows;
+        let mut rle = false;
+        let mut payload_len = match &mut self.codec {
+            Codec::Raw => raw_len,
+            Codec::Rle => {
+                let raw = &self.input[..raw_len];
+                if let Some(count) = encoding::rle_into(raw, &mut self.frame[6..6 + raw_len]) {
+                    rle = true;
+                    count
+                } else {
+                    self.frame[6..6 + raw_len].copy_from_slice(raw);
+                    raw_len
+                }
+            }
+            Codec::Lzo(dictionary) => encoding::lzo_into(
+                &self.input[..raw_len],
+                &mut self.frame[10..6 + self.max_payload],
+                dictionary,
+            )?,
+            Codec::Zlib(compressor) => encoding::zlib_into(
+                &self.input[..raw_len],
+                &mut self.frame[10..6 + self.max_payload],
+                compressor,
+            )?,
+        };
+        if matches!(self.codec, Codec::Lzo(_) | Codec::Zlib(_)) {
+            self.frame[6..8].copy_from_slice(
+                &u16::try_from(raw_len)
+                    .map_err(|_| invalid("The uncompressed block exceeds 65535 bytes."))?
+                    .to_le_bytes(),
+            );
+            self.frame[8..10].copy_from_slice(
+                &u16::try_from(payload_len)
+                    .map_err(|_| invalid("The compressed block exceeds 65535 bytes."))?
+                    .to_le_bytes(),
+            );
+            payload_len += 4;
+        }
+        let payload = &self.frame[6..6 + payload_len];
+        let command = match &self.codec {
+            Codec::Rle if rle => Command::RleRow(payload),
+            Codec::Raw | Codec::Rle => Command::RawRow(payload),
+            Codec::Lzo(_) | Codec::Zlib(_) => match self.format {
+                PixelFormat::Mono => Command::CompressedMono(payload),
+                PixelFormat::Gray4 => Command::CompressedGray(payload),
+            },
+        }
+        .code();
+        let length = finish_into(
+            HEADER,
+            command,
+            0,
+            payload_len,
+            self.max_payload,
+            &mut self.frame,
+        )?;
+        Ok(&self.frame[..length])
     }
 }
 
@@ -452,19 +549,23 @@ macro_rules! driver {
         impl Driver for $name {
             type Options = $options;
             fn name(self) -> &'static str { ($spec).name }
-            fn supports_gray4(self) -> bool { ($spec).gray_encoding.is_some() }
+            fn supports(self, format: PixelFormat) -> bool {
+                match format {
+                    PixelFormat::Mono => true,
+                    PixelFormat::Gray4 => ($spec).gray_encoding.is_some(),
+                }
+            }
             fn validate(self, options: &$options, format: PixelFormat) -> Result<()> {
                 ($spec).validate(&options.controls(), format).map(|_| ())
             }
         }
         impl Operations for $name {
-            type Job = Job;
+            type Stream = Stream;
             fn settings(&self) -> Settings { ($spec).settings() }
             fn decoder(&self) -> Decoder { Decoder::new(HEADER, ($spec).max_payload, true) }
-            fn prepare(&self, raster: &Raster, options: &$options) -> Result<Job> { ($spec).prepare(raster, &options.controls()) }
-            async fn submit<T: Transport>(operation: &mut Operation<'_, T, Self>, job: &Job, submitted: &mut usize) -> Result<Completion> {
-                submit(operation, job, submitted).await
-            }
+            // Common-family framing does not declare a job height; MXW01 requires it.
+            fn stream(&self, _height: u32, format: PixelFormat, options: &$options) -> Result<Stream> { ($spec).stream(format, &options.controls()) }
+            async fn submit<T: Transport, S: RowSource>(operation: &mut Operation<'_, T, Self>, stream: &mut Stream, rows: &mut RowReader<'_, S>, submitted: &mut usize) -> Result<Completion> { submit(operation, stream, rows, submitted).await }
             async fn status<T: Transport>(operation: &mut Operation<'_, T, Self>) -> Result<PrinterStatus> {
                 let command = Command::Query(Query::State).prepare(($spec).max_payload)?;
                 operation.status(&command).await
@@ -747,11 +848,7 @@ pub enum Mode {
     Label = 3,
 }
 
-/// A query encoded by [`Command::Query`] for the common protocol family.
-///
-/// Applications use [`Printer::status`](crate::Printer::status) and [`Printer::device_info`](crate::Printer::device_info).
-/// Reply layouts differ by firmware.
-/// Both queries are available on all common-family drivers.
+/// Queries supported by the common family. Reply layouts vary by firmware.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Query {
     /// State or start handshake (`A3 00`).
@@ -770,15 +867,11 @@ impl Query {
     }
 }
 
-/// One outgoing command in the common protocol family.
+/// An outgoing common-family command with its control value or raster payload.
 ///
-/// [`Self::encode`] produces a complete frame but does not transmit it.
-/// Commands cover both basic and extended firmware. The encoder enforces wire
-/// limits and individual control ranges, not driver compatibility or job order.
-/// Use [`Printer`](crate::Printer) for complete print jobs and device queries.
-///
-/// Slice variants borrow bytes only during encoding. Compressed variants expect
-/// payloads from [`crate::encoding`], including their length prefixes.
+/// Encoding checks payload limits and control ranges, not raster contents,
+/// job order, or driver compatibility. Streaming uses [`Self::code`] to frame
+/// an already encoded payload in place.
 #[derive(Debug, Clone, Copy)]
 enum Command<'a> {
     /// Probable retract distance in rows. Direction and units remain observed.
@@ -787,6 +880,12 @@ enum Command<'a> {
     Feed(u16),
     /// One packed monochrome row, leftmost pixel in bit zero.
     RawRow(&'a [u8]),
+    /// One RLE monochrome row, with color in bit seven and run length below it.
+    RleRow(&'a [u8]),
+    /// Compressed monochrome bytes with little-endian raw and compressed lengths.
+    CompressedMono(&'a [u8]),
+    /// Compressed grayscale bytes with little-endian raw and compressed lengths.
+    CompressedGray(&'a [u8]),
     /// A documented query.
     Query(Query),
     /// Quality from 1 through 5, encoded as `31` through `35`.
@@ -805,23 +904,33 @@ enum Command<'a> {
     Mode(Mode),
     /// Extended print mode for sixteen grayscale levels.
     GrayscaleMode(Mode),
-    /// Run lengths, with color in bit seven and count in bits zero through six.
-    RleRow(&'a [u8]),
-    /// `CE` payload from the compression encoder, including both length prefixes.
-    CompressedMono(&'a [u8]),
-    /// `CF` row or band payload, including both length prefixes.
-    CompressedGray(&'a [u8]),
     /// Extended density from zero through 200, prefixed by `01`.
     Density(u8),
 }
 impl Command<'_> {
-    /// Encode a command within a selected driver's payload ceiling.
-    ///
-    /// The driver supplies the firmware payload limit.
-    /// The encoder does not test raster widths or compressed payload contents.
+    /// Return the wire command byte without encoding or validating the payload.
+    const fn code(self) -> u8 {
+        match self {
+            Self::Retract(_) => 0xa0,
+            Self::Feed(_) => 0xa1,
+            Self::RawRow(_) => 0xa2,
+            Self::Query(query) => query.command(),
+            Self::Quality(_) | Self::Concentration(_) => 0xa4,
+            Self::LatticeStart | Self::LatticeEnd => 0xa6,
+            Self::Energy(_) => 0xaf,
+            Self::Speed(_) => 0xbd,
+            Self::Mode(_) | Self::GrayscaleMode(_) => 0xbe,
+            Self::RleRow(_) => 0xbf,
+            Self::CompressedMono(_) => 0xce,
+            Self::CompressedGray(_) => 0xcf,
+            Self::Density(_) => 0xf2,
+        }
+    }
+
+    /// Encode a complete frame within the driver's payload limit.
     ///
     /// # Errors
-    /// Reject invalid control values, invalid RLE runs, or an oversized payload.
+    /// Reject invalid control values or an oversized payload.
     fn encode(self, max_payload: usize) -> Result<Vec<u8>> {
         Ok(self.prepare(max_payload)?.bytes)
     }
@@ -829,63 +938,52 @@ impl Command<'_> {
     fn prepare(self, max_payload: usize) -> Result<EncodedCommand> {
         let scalar;
         let pair;
-        let (command, payload): (u8, &[u8]) = match self {
+        let command = self.code();
+        let payload: &[u8] = match self {
             Self::Retract(value) | Self::Feed(value) | Self::Energy(value) => {
                 pair = value.to_le_bytes();
-                (
-                    match self {
-                        Self::Retract(_) => 0xa0,
-                        Self::Feed(_) => 0xa1,
-                        _ => 0xaf,
-                    },
-                    &pair,
-                )
+                &pair
             }
-            Self::Query(query) => {
+            Self::Query(_) => {
                 scalar = [0];
-                (query.command(), &scalar)
+                &scalar
             }
             Self::Quality(value) => {
                 validate_quality(value)?;
                 scalar = [0x30 + value];
-                (0xa4, &scalar)
+                &scalar
             }
             Self::Concentration(value) => {
                 validate_concentration(value)?;
                 scalar = [value];
-                (0xa4, &scalar)
+                &scalar
             }
             Self::Speed(value) => {
                 validate_speed(value)?;
                 scalar = [value];
-                (0xbd, &scalar)
+                &scalar
             }
             Self::Density(value) => {
                 if value > 200 {
                     return Err(invalid("Density cannot exceed 200."));
                 }
                 pair = [1, value];
-                (0xf2, &pair)
+                &pair
             }
             Self::Mode(mode) => {
                 scalar = [mode as u8];
-                (0xbe, &scalar)
+                &scalar
             }
             Self::GrayscaleMode(mode) => {
                 pair = [mode as u8, 1];
-                (0xbe, &pair)
+                &pair
             }
-            Self::LatticeStart => (0xa6, &LATTICE_START),
-            Self::LatticeEnd => (0xa6, &LATTICE_END),
-            Self::RawRow(row) => (0xa2, row),
-            Self::RleRow(row) => {
-                if row.is_empty() || row.iter().any(|byte| byte.trailing_zeros() >= 7) {
-                    return Err(invalid("RLE runs must contain 1 through 127 pixels."));
-                }
-                (0xbf, row)
-            }
-            Self::CompressedMono(data) => (0xce, data),
-            Self::CompressedGray(data) => (0xcf, data),
+            Self::LatticeStart => &LATTICE_START,
+            Self::LatticeEnd => &LATTICE_END,
+            Self::RawRow(payload)
+            | Self::RleRow(payload)
+            | Self::CompressedMono(payload)
+            | Self::CompressedGray(payload) => payload,
         };
         let bytes = encode(HEADER, command, 0, payload, max_payload)?;
         Ok(EncodedCommand { command, bytes })
@@ -896,91 +994,141 @@ impl Command<'_> {
 mod tests {
     use super::*;
     use std::io::Read;
-    type TestResult = std::result::Result<(), Box<dyn std::error::Error>>;
 
-    fn lzo_round_trip<D: Driver + Operations<Job = Job>>(
-        driver: D,
-        format: PixelFormat,
-        height: usize,
-    ) -> TestResult {
-        let row_size = if format == PixelFormat::Mono { 48 } else { 192 };
-        let mut state = 23_u32;
-        let data: Vec<_> = (0..row_size * height)
+    fn high_entropy_bytes(length: usize) -> Vec<u8> {
+        let mut state = 0x937a_4d81_u32;
+        (0..length)
             .map(|_| {
-                state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
-                state.to_be_bytes()[0]
+                state ^= state << 13;
+                state ^= state >> 17;
+                state ^= state << 5;
+                state.to_le_bytes()[0]
             })
-            .collect();
-        let raster = Raster::new(driver.printable_width(), data.clone(), format)?;
-        let job = driver.prepare(&raster, &Default::default())?;
-        let mut parser = Decoder::new(HEADER, 4096, true);
-        let mut decoded = Vec::new();
-        for bytes in &job.frames {
-            let frame = parser.feed_positioned(bytes).remove(0).1;
-            assert_eq!(
-                frame.command,
-                if format == PixelFormat::Mono {
-                    0xce
-                } else {
-                    0xcf
+            .collect()
+    }
+
+    #[test]
+    fn lzo_rows_and_bands_round_trip_all_requested_heights() -> Result<()> {
+        for (format, encoding, band) in [
+            (PixelFormat::Mono, RasterEncoding::Lzo, 1),
+            (PixelFormat::Gray4, RasterEncoding::Lzo, 1),
+            (PixelFormat::Gray4, RasterEncoding::LzoBands, 20),
+        ] {
+            let row_bytes = if format == PixelFormat::Mono { 48 } else { 192 };
+            let max_payload = if encoding == RasterEncoding::LzoBands {
+                4096
+            } else {
+                255
+            };
+            let mut encoder = RowEncoder::new(format, row_bytes, encoding, max_payload)?;
+            for height in [1, 19, 20, 21, 39, 40, 41] {
+                let expected = high_entropy_bytes(row_bytes * height);
+                let mut decoded = Vec::new();
+                let mut offset = 0;
+                while offset < height {
+                    let count = band.min(height - offset);
+                    let input_len = count * row_bytes;
+                    encoder.input_mut()[..input_len]
+                        .copy_from_slice(&expected[offset * row_bytes..][..input_len]);
+                    let frame = encoder.encode(count)?.to_vec();
+                    let frame = Decoder::new(HEADER, max_payload, true)
+                        .feed_positioned(&frame)
+                        .remove(0)
+                        .1;
+                    assert_eq!(
+                        frame.command,
+                        if format == PixelFormat::Mono {
+                            0xce
+                        } else {
+                            0xcf
+                        }
+                    );
+                    let raw_len = u16::from_le_bytes([frame.payload[0], frame.payload[1]]) as usize;
+                    let compressed_len =
+                        u16::from_le_bytes([frame.payload[2], frame.payload[3]]) as usize;
+                    assert_eq!(raw_len, input_len);
+                    assert_eq!(compressed_len, frame.payload.len() - 4);
+                    let mut output = vec![0; raw_len];
+                    assert_eq!(
+                        lzokay::decompress::decompress(&frame.payload[4..], &mut output)
+                            .map_err(|error| Error::Compression(error.to_string()))?,
+                        raw_len
+                    );
+                    decoded.extend(output);
+                    offset += count;
                 }
-            );
-            let raw_len = usize::from(u16::from_le_bytes([frame.payload[0], frame.payload[1]]));
-            let compressed_len =
-                usize::from(u16::from_le_bytes([frame.payload[2], frame.payload[3]]));
-            assert_eq!(compressed_len, frame.payload.len() - 4);
-            let mut output = vec![0; raw_len];
-            assert_eq!(
-                lzokay::decompress::decompress(&frame.payload[4..], &mut output)?,
-                raw_len
-            );
-            decoded.extend(output);
+                assert_eq!(decoded, expected);
+            }
         }
-        assert_eq!(decoded, data);
-        assert_eq!(job.frames.len(), 3);
         Ok(())
     }
+
     #[test]
-    fn lzo_rows_and_bands_round_trip() -> TestResult {
-        lzo_round_trip(X6h, PixelFormat::Mono, 3)?;
-        lzo_round_trip(X6h, PixelFormat::Gray4, 3)?;
-        lzo_round_trip(V5g, PixelFormat::Gray4, 41)
+    fn rle_equal_size_stays_rle_and_expanding_data_falls_back_to_raw() -> Result<()> {
+        let mut encoder = RowEncoder::new(PixelFormat::Mono, 48, RasterEncoding::Rle, 255)?;
+        let equal: Vec<u8> = (0..48).map(|i| if i % 2 == 0 { 0xff } else { 0 }).collect();
+        encoder.input_mut().copy_from_slice(&equal);
+        let frame = encoder.encode(1)?.to_vec();
+        let frame = Decoder::new(HEADER, 255, true)
+            .feed_positioned(&frame)
+            .remove(0)
+            .1;
+        assert_eq!(frame.command, 0xbf);
+        assert_eq!(frame.payload.len(), equal.len());
+        let raw: Vec<u8> = (0..48)
+            .map(|i| if i % 2 == 0 { 0x55 } else { 0xaa })
+            .collect();
+        encoder.input_mut().copy_from_slice(&raw);
+        let frame = encoder.encode(1)?.to_vec();
+        let frame = Decoder::new(HEADER, 255, true)
+            .feed_positioned(&frame)
+            .remove(0)
+            .1;
+        assert_eq!(frame.command, 0xa2);
+        assert_eq!(frame.payload, raw);
+        Ok(())
     }
+
     #[test]
-    fn zlib_frames_round_trip() -> TestResult {
+    fn zlib_rows_round_trip_with_reused_compressor() -> Result<()> {
         for format in [PixelFormat::Mono, PixelFormat::Gray4] {
-            let raw = vec![0xa5; if format == PixelFormat::Mono { 48 } else { 192 }];
-            let raster = Raster::new(V5g.printable_width(), raw.clone(), format)?;
-            let job = V5g.prepare(
-                &raster,
-                &V5gOptions {
-                    encoding: Some(V5gEncoding::ZlibExperimental),
-                    ..Default::default()
-                },
-            )?;
-            let frame = Decoder::new(HEADER, 4096, true)
-                .feed_positioned(&job.frames[0])
-                .remove(0)
-                .1;
-            assert_eq!(
-                frame.command,
-                if format == PixelFormat::Mono {
-                    0xce
-                } else {
-                    0xcf
+            let row_bytes = if format == PixelFormat::Mono { 48 } else { 192 };
+            let mut encoder =
+                RowEncoder::new(format, row_bytes, RasterEncoding::ZlibExperimental, 4096)?;
+            for height in [1, 19, 20, 21, 39, 40, 41] {
+                let expected = high_entropy_bytes(row_bytes * height);
+                let mut decoded = Vec::new();
+                for (row_index, expected_row) in expected.chunks_exact(row_bytes).enumerate() {
+                    encoder.input_mut()[..row_bytes].copy_from_slice(expected_row);
+                    let bytes = encoder.encode(1)?.to_vec();
+                    let frame = Decoder::new(HEADER, 4096, true)
+                        .feed_positioned(&bytes)
+                        .remove(0)
+                        .1;
+                    assert_eq!(
+                        frame.command,
+                        if format == PixelFormat::Mono {
+                            0xce
+                        } else {
+                            0xcf
+                        }
+                    );
+                    assert_eq!(
+                        u16::from_le_bytes([frame.payload[0], frame.payload[1]]) as usize,
+                        row_bytes
+                    );
+                    let compressed =
+                        u16::from_le_bytes([frame.payload[2], frame.payload[3]]) as usize;
+                    assert_eq!(compressed, frame.payload.len() - 4);
+                    let mut output = Vec::new();
+                    flate2::read::ZlibDecoder::new(&frame.payload[4..])
+                        .read_to_end(&mut output)
+                        .map_err(|error| Error::Compression(error.to_string()))?;
+                    assert_eq!(output, expected_row, "row {row_index}");
+                    decoded.extend(output);
                 }
-            );
-            assert_eq!(
-                usize::from(u16::from_le_bytes([frame.payload[0], frame.payload[1]])),
-                raw.len()
-            );
-            assert_eq!(
-                usize::from(u16::from_le_bytes([frame.payload[2], frame.payload[3]])),
-                frame.payload.len() - 4
-            );
-            let mut output = Vec::new();
-            flate2::read::ZlibDecoder::new(&frame.payload[4..]).read_to_end(&mut output)?;
-            assert_eq!(output, raw);
+                assert_eq!(decoded, expected);
+            }
         }
         Ok(())
     }

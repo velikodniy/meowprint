@@ -74,7 +74,7 @@
 //!
 //! Pass `&Default::default()` or matching controls such as [`Gt01Options`].
 //! The print future exclusively borrows the printer, source, and controls until
-//! it settles. Compression is bounded by a row or band, not the document size.
+//! it completes. Rows are compressed and submitted incrementally.
 //!
 //! Enable the `image` feature to convert an `image::DynamicImage` to Mono or Gray4:
 //!
@@ -124,14 +124,14 @@
 //! After a successful print or query, you can reuse the same printer.
 //! [`PrintReport::completion`] describes how printing finished. Some drivers wait
 //! for a fixed interval, while MXW01 waits for a completion message.
-//! Neither result guarantees the appearance of the printed paper.
+//! Neither result proves that every row reached the paper or guarantees print quality.
 //!
 //! Invalid source metadata or controls leave the connection usable without reading
 //! rows or performing I/O. Source and compression failures after submission begins
 //! disable it, including first-row failures before writes. Later failures may leave
 //! partial output. Communication failures, cancellation, and dropping an active
-//! operation also disable further use. A genuine printer condition detected before
-//! a write can leave the connection usable. After errors, use [`Printer::is_usable`].
+//! operation also disable the connection. A condition reported by the printer before
+//! any write can leave it usable. After errors, use [`Printer::is_usable`].
 //! Always await [`Printer::disconnect`] when you finish, including after errors.
 //! Previously submitted rows can still print. Meowprint does not retry automatically.
 //!
@@ -152,10 +152,10 @@
 //! Meowprint requires `std`; disabling default features removes native Bluetooth,
 //! not the standard library. Printer communication requires Tokio.
 //! The `image` feature works with or without `bluetooth`.
-//! Advanced BLE backends can use [`Driver::ble_profile`] to obtain the driver's
-//! fixed UUID metadata without native Bluetooth. Backend setup must still discover,
-//! validate, and subscribe to a compatible service as described by [`BleProfile`]
-//! and [`Transport`]. Ordinary native callers continue using `Device::connect`.
+//! Custom BLE backends can use [`Driver::ble_profile`] without native Bluetooth.
+//! Before creating a printer, discover, validate, and subscribe to a compatible
+//! service as described by [`BleProfile`] and [`Transport`].
+//! For native Bluetooth connections, use `Device::connect`.
 //! The [protocol reference](protocol) records firmware research for driver
 //! development and custom transports.
 

@@ -36,7 +36,7 @@ meowprint print --device MX10 --driver mx10 text 'Hello from Meowprint!'
 ```
 
 See the [command-line guide](crates/meowprint-cli/README.md) for more examples and the [API documentation](https://docs.rs/meowprint) for library use.
-The [protocol reference](crates/meowprint/docs/protocol.md) describes firmware behavior and compatibility.
+The [protocol reference](crates/meowprint/docs/protocol.md) describes observed firmware behavior and compatibility limits.
 
 ## Development
 

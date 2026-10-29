@@ -97,7 +97,7 @@ pub use common::{
 };
 pub use mxw01::{Mxw01, Mxw01Options, ReplyFormat as Mxw01ReplyFormat};
 
-/// Resolved private representation of packed pixels.
+/// Compression for packed raster rows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RasterEncoding {
     /// Uncompressed monochrome pixels.
@@ -112,10 +112,10 @@ pub(crate) enum RasterEncoding {
     ZlibExperimental,
 }
 
-/// A built-in firmware driver with its own print controls.
+/// A built-in driver for a printer firmware, with its print controls.
 ///
 /// Use a built-in driver such as [`Gt01`] or [`Mxw01::default()`].
-/// Applications cannot implement this trait. To supply another connection type,
+/// Applications cannot implement this trait. To use another connection type,
 /// implement [`Transport`].
 #[expect(
     private_bounds,
@@ -246,7 +246,7 @@ pub(crate) enum Movement {
     Commands(Vec<EncodedCommand>),
     BlankRows { frame: Vec<u8>, count: u16 },
 }
-/// Internal driver operations, sealed to keep wire types out of the public API.
+/// Driver-specific submission, queries, and reply handling.
 pub(crate) trait Operations: Sized + Send + Sync {
     type Stream: Send;
     fn settings(&self) -> Settings;

@@ -24,7 +24,7 @@ Save a PNG preview for the MX10 driver:
 meowprint preview --driver mx10 -o preview.png image input.jpg
 ```
 
-Previews are expanded from the packed raster without Bluetooth access. The CLI renders and packs the full page before connecting; `print --preview` saves that exact raster before discovery or submission.
+Previews show the rendered raster without Bluetooth access. The CLI renders and packs the full page before connecting; `print --preview` saves that same raster before discovery or submission.
 
 Find your printer and list the available drivers:
 
@@ -34,9 +34,8 @@ meowprint drivers
 ```
 
 `meowprint drivers` needs no Bluetooth access. Every listed driver supports Mono.
-Its `grayscale true` entries (X6h and V5g) also support Gray4 through `image --grayscale`;
-`grayscale false` means Mono only. See the [supported-format table](../meowprint/README.md#supported-pixel-formats)
-for all drivers and the library's capability checks.
+The X6h and V5g drivers also support Gray4 with `image --grayscale`; other drivers support Mono only.
+See the [supported-format table](../meowprint/README.md#supported-pixel-formats).
 
 The `--device` value selects a printer by name or identifier from the scan.
 The `--driver` value selects the commands for its firmware.
@@ -53,7 +52,7 @@ Roboto supports Latin, Greek, and Cyrillic text.
 Use `text --font path/to/font.ttf` to select another TrueType or OpenType font.
 
 Run `meowprint --help` for all commands and `meowprint print --help` for print controls.
-The CLI renders, validates, and packs input before opening a Bluetooth connection. During printing, the library submits rows incrementally rather than compressing the complete page in advance. A later input or compression failure can occur after earlier rows were sent; the print outcome is then unknown, so do not retry automatically.
+The CLI renders, validates, and packs input before opening a Bluetooth connection. During printing, rows are submitted incrementally. If a later input or compression error occurs after rows have been sent, the print outcome is unknown; do not retry automatically.
 See the [protocol reference](https://docs.rs/meowprint/latest/meowprint/protocol/index.html) for firmware compatibility.
 
 ## Read printer information

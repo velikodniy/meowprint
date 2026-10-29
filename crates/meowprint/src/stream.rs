@@ -52,15 +52,15 @@ impl<T: Transport, D: Driver> Printer<T, D> {
     /// Stream packed rows to the printer.
     ///
     /// Metadata and options are validated before rows are requested or printer I/O
-    /// begins. The printer, source, and options remain borrowed until submission
-    /// settles. Exactly the declared height is read, with no extra EOF probe.
-    /// The source owns input deadlines; an unpaused source can wait indefinitely.
+    /// begins. The printer, source, and options remain borrowed until printing
+    /// completes. Exactly the declared height is read, with no extra EOF probe.
+    /// The source owns input deadlines; a row can remain pending indefinitely.
     ///
     /// # Errors
     /// Invalid metadata or options cause no source reads or transport I/O and
     /// leave the printer usable. Source and encoding failures after submission
     /// begins disable it, even before the first write; earlier output may print.
-    /// A genuine printer condition rejected before a write can leave it usable.
+    /// A reported printer condition rejected before a write can leave it usable.
     /// Communication failures, cancellation, and dropping an active future disable
     /// the connection. Obtain cancellation before starting, keep awaiting after
     /// cancellation, and always await [`Self::disconnect`], including after errors.

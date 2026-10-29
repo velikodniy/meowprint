@@ -83,8 +83,7 @@ Some printers use Bluetooth Classic Serial Port Profile instead of BLE GATT. \[[
 
 ## Printer names and variants
 
-These names have tentative associations with the variants below. They do not guarantee compatibility for every unit.
-The listed formats use 384-dot rows. \[[NaitLee models][naitlee-models]\] \[[TiMini models][timini-models]\] \[[TiMini profiles][timini-profiles]\]
+These names have tentative associations with the variants below; they do not guarantee compatibility for every unit. The listed formats use 384-dot rows. \[[NaitLee models][naitlee-models]\] \[[TiMini models][timini-models]\] \[[TiMini profiles][timini-profiles]\]
 
 | Advertised name | Protocol variant | Limitations |
 | --- | --- | --- |
@@ -108,7 +107,7 @@ GATT discovery does not reveal raster encoding, command order, energy byte order
 No reliable capability-negotiation command is documented.
 
 Use the advertised name, manufacturer data, address, and discovered services together to identify a variant.
-Names can contain a model prefix and a suffix. For example, `MXTP-100` includes the prefix `MXTP`.
+Names can include a model prefix and a suffix. For example, `MXTP-100` includes the prefix `MXTP`.
 Name matching can be case-sensitive. `X6h` and `X6H` do not guarantee the same firmware. \[[NaitLee models][naitlee-models]\] \[[TiMini models][timini-models]\]
 
 BLE privacy can rotate addresses, and some platforms expose device identifiers instead of MAC addresses.
@@ -138,8 +137,7 @@ The following GATT layout applies to GT01. Other devices can omit entries. \[[GT
 | `AE3B` | Write Without Response | unknown auxiliary input |
 | `AE3C` | Notify | unknown auxiliary output |
 
-Use the Bluetooth base UUID for each suffix.
-For example, `AE01` expands to `0000ae01-0000-1000-8000-00805f9b34fb`.
+Expand each suffix with the Bluetooth base UUID. For example, `AE01` expands to `0000ae01-0000-1000-8000-00805f9b34fb`.
 
 Some units advertise `AF30` rather than `AE30`. \[[MX10 advertising][lboue]\]
 
@@ -181,20 +179,19 @@ For example, one GT01 ATT Write Command carries `51 78 A8 00 01 00 00 00 FF 51 7
 This byte-stream behavior belongs to the printer protocol. BLE itself does not define printer frame boundaries.
 
 Keep incomplete frames until the remaining bytes arrive.
-Before interpreting a frame, make sure that its length, terminator, and CRC are valid.
+Before interpreting a frame, validate its length, terminator, and CRC.
 After an invalid frame, search for the next `51 78` preamble.
-Keep a trailing `51` if the next byte has not arrived yet.
-The `22 21` family requires a separate frame interpretation.
+If the buffer ends with `51`, keep it until the next byte arrives.
+The `22 21` family has a different frame format.
 
 On one MX10 variant, a malformed `BC` frame declares 513 payload bytes but supplies one.
 The printer consumes subsequent commands and raster rows as part of that payload. \[[MX10 behavior][cataclysm]\]
 
 ### CRC-8
 
-CRC-8 treats the payload as a polynomial over `GF(2)`, arithmetic with binary coefficients.
-Addition and subtraction use XOR, which sets a bit when its inputs differ.
+CRC-8 treats the payload as a polynomial over `GF(2)`, the field with binary coefficients. Addition and subtraction use XOR.
 
-The generator is `g(x) = x^8 + x^2 + x + 1`, written as `0x107`. Code stores only the lower coefficients as `0x07`, because the `x^8` term is implicit.
+The generator is `g(x) = x^8 + x^2 + x + 1`, written as `0x107`. The stored value `0x07` omits the implicit `x^8` term.
 
 The initial register is `0x00`. Process each byte most-significant bit first. Do not reflect the input or output, and do not apply a final XOR.
 
@@ -229,7 +226,7 @@ Raster payloads carry the printed content in plain form. Anything that records t
 
 ## Common command map
 
-Command meanings and payloads are as follows. Tentative meanings remain marked. \[[NaitLee commands][naitlee-commander]\] \[[GT01 capture][lisp-readme]\] \[[X6h protocol][x6h]\]
+The command map below lists known meanings and payloads. Tentative meanings are marked. \[[NaitLee commands][naitlee-commander]\] \[[GT01 capture][lisp-readme]\] \[[X6h protocol][x6h]\]
 
 | ID | Meaning | Payload | Notes |
 | ---: | --- | --- | --- |
@@ -285,7 +282,7 @@ The mode byte selects image or text processing. It does not set thermal energy.
 
 ### `A6` lattice frames
 
-The two lattice payloads are fixed 11-byte constants, so the length field is always `0B 00`. The complete frames are:
+Both lattice payloads are fixed at 11 bytes, so the length field is always `0B 00`. The complete frames are:
 
 ```text
 start: 51 78 A6 00 0B 00 AA 55 17 38 44 5F 5F 5F 44 38 2C A1 FF
@@ -340,7 +337,7 @@ bit 7    color: 0 white, 1 black
 bits 0-6 run length: 1 through 127 pixels
 ```
 
-Split longer runs at 127 pixels. For example, a blank 384-pixel row becomes `7F 7F 7F 03`.
+Split longer runs into runs of at most 127 pixels. For example, a blank 384-pixel row becomes `7F 7F 7F 03`.
 
 Some firmware accepts `BF` rows alongside raw `A2` rows. For a 384-pixel row, an RLE payload above 48 bytes exceeds the raw size. \[[rbaron commands][rbaron-cmds]\]
 On firmware that accepts both formats, use `A2` when the RLE payload exceeds 48 bytes.
@@ -385,17 +382,16 @@ sequenceDiagram
     AE02-->>App: ready or resumed
 ```
 
-Some firmware variants place configuration before lattice start. Some add `A9 00` or a second `A3`. Prefixed-start models prepend `12` to the first `A3` frame only. Command order depends on the firmware.
+Some firmware variants place configuration before lattice start. Others add `A9 00` or a second `A3`. Prefixed-start models prepend `12` to the first `A3` frame only.
 
-Blank `A2` rows advance paper without `A1`. For MX05, MX06, MX08, MX09, and MX10, 128 blank rows are a tentative feed alternative.
+Blank `A2` rows advance paper without `A1`. For MX05, MX06, MX08, MX09, and MX10, 128 blank rows may be an alternative feed method.
 On one MX10 variant, blank-row feeding works, but `A1` behavior remains unconfirmed. \[[NaitLee models][naitlee-models]\] \[[MX10 behavior][cataclysm]\]
 
 ### Final feed count and position
 
 The GT01 sequence sends `A1 30 00` twice, for a total of 96 rows. Feed count depends on the model.
 
-Reference feed counts are two commands for Tiny and one for V5G.
-These counts are model configuration values, not a requirement for every device in either family. \[[TiMini profiles][timini-profiles]\]
+Reference feed counts are two commands for Tiny and one for V5G. These are model configuration values, not requirements for every device in either family. \[[TiMini profiles][timini-profiles]\]
 
 The final feed pushes the printed area past the tear bar. \[[GT01 capture][lisp-readme]\]
 
@@ -568,7 +564,7 @@ No stronger completion signal is documented for the common family. A zero `AE` f
 
 ### Reference wait times
 
-These values bound connection attempts and waits. They are not printer response-time guarantees.
+These are reference wait times, not guarantees of printer response time.
 
 | Operation | Reference wait |
 | --- | ---: |
@@ -586,10 +582,10 @@ Keep the connection open during the completion wait. A fixed delay does not prov
 
 ### Retries and cancellation
 
-The common protocol has no transaction identifier. A late reply cannot always be distinguished from a reply to a later request.
-It also provides no row offset from which to resume a disconnected job.
+The common protocol has no transaction identifier, so a late reply may be indistinguishable from a reply to a later request.
+It also provides no row offset for resuming a disconnected job.
 Repeating a raster or feed command can duplicate pixels or paper movement.
-Do not automatically retry a write whose delivery is uncertain, or resume a job after disconnection.
+Do not automatically retry a write when delivery is uncertain or resume a job after disconnection.
 
 Commands and raster rows share one ordered stream on `AE01`.
 There is no job identifier that separates interleaved jobs.
@@ -599,7 +595,7 @@ Cancellation cannot reliably recall rows that the printer already accepted.
 
 ## MXW01 summary
 
-MXW01 shares `AE30`, `AE01`, and `AE02`, but it is not wire-compatible with the common family. Some payload and reply fields remain uncertain. \[[MXW01 protocol][mxw01]\]
+MXW01 uses `AE30`, `AE01`, and `AE02`, but its wire protocol is incompatible with the common family. Some payload and reply fields remain uncertain. \[[MXW01 protocol][mxw01]\]
 
 The control preamble is `22 21`. Outgoing byte 3 is `00`, with an unknown purpose.
 The length is `u16le`, and the payload CRC-8 and `FF` terminator match the common format.

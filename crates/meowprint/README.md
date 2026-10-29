@@ -47,15 +47,15 @@ async fn main() -> meowprint::Result<()> {
 
 `Bluetooth::find` accepts an exact device name or a platform device identifier. Use `Bluetooth::scan` to list devices. If several devices share a name, use an identifier to select one.
 
-Discovery requires a powered adapter. For backends without an initial power-state query, Meowprint permits an initial `Unknown` state and lets scanning report failures. Explicit powered-off states are still rejected. If an adapter's state query fails, discovery can use other eligible adapters; if none are eligible, the query error is returned. Enable Bluetooth and grant the application Bluetooth access before discovery.
+Discovery requires a powered Bluetooth adapter. On Android, adapters with an unknown initial power state may also be scanned. Adapters reported as powered off are rejected. A state-query failure does not prevent discovery through another eligible adapter; if none are eligible, the query error is returned. Enable Bluetooth and grant the application Bluetooth access before discovery.
 
 ## Supply and print rows
 
-`Printer::print(&mut source, &options).await` submits a `RowSource` with fixed width, height, and pixel format. Each successful `read_row` fills the entire packed-row destination. The library reads exactly the declared height: no EOF probe, trailing-data validation, implicit replay, or source resumption. The source or document owner handles framing and input deadlines. Without its own deadline, input can remain pending until cancellation or a printer fault.
+`Printer::print(&mut source, &options).await` reads packed rows from a `RowSource` with fixed width, height, and pixel format. Each successful `read_row` call fills the entire destination buffer. The library requests exactly the declared number of rows. It does not read an extra row to check for end-of-input, validate trailing data, or restart the source. The source or its caller handles document framing and input deadlines. Without a source deadline, a row read can remain pending until cancellation or a printer fault.
 
-While input is pending, notification handling cooperatively yields so other Tokio tasks can supply rows or request cancellation, even when a custom transport continuously returns ready events.
+While a row read is pending, other Tokio tasks can supply input or request cancellation, including when transport events are continuously available.
 
-For buffered pixels, construct `Raster::new(width, bytes, format)` and pass `&mut raster.rows()` to `print`. The cursor borrows pixels without cloning or consuming them. A fresh `raster.rows()` explicitly starts again. The print future borrows the printer, source, and controls until it settles; finish it before starting another operation.
+For buffered pixels, construct `Raster::new(width, bytes, format)` and pass `&mut raster.rows()` to `print`. The cursor borrows pixels without cloning or consuming them. Each `raster.rows()` call starts at the first row. The print future borrows the printer, source, and controls until it completes; await it before starting another operation.
 
 Each row must fill `Printer::printable_width()` dots. All built-in drivers use a width of 384 dots. Store rows from top to bottom, with no headers or gaps:
 
@@ -135,7 +135,7 @@ let report = printer.print(&mut raster.rows(), &Default::default()).await?;
 
 Your application loads image files, draws text, and resizes images. `Raster::from_image` rejects images wider than the print head and keeps the original size. `Position` controls horizontal alignment; unused columns stay white. Transparent pixels are composited on white.
 
-`ImageConversion::Mono(Dither::default())` uses Ostromoukhov diffusion. Stucki, Floyd–Steinberg, and Threshold are also available. Use `ImageConversion::Mono(Dither::Threshold)` for images already black and white. Choose `ImageConversion::Gray4` instead to round luminance to 16 levels without monochrome dithering, for X6h or V5G. The library handles quantization and low-nibble-left packing; callers do not need a separate Gray4 packing loop. Use `Raster::new` when the input is already packed.
+`ImageConversion::Mono(Dither::default())` uses Ostromoukhov dithering. Stucki, Floyd–Steinberg, and Threshold are also available. Use `ImageConversion::Mono(Dither::Threshold)` for images already black and white. For X6h or V5G grayscale output, `ImageConversion::Gray4` rounds luminance to 16 levels and packs pixels in the Gray4 format. Use `Raster::new` when the input is already packed.
 
 `raster.preview()` returns an `image::GrayImage` of the exact packed pixels, excluding driver-added blank rows and paper feed. Editing the preview does not change the raster or predict physical print quality. No printer, transport, or Tokio runtime is needed; see the [offline preview example](examples/preview.rs).
 
@@ -148,11 +148,13 @@ cargo run --locked -p meowprint --no-default-features --features image \
 
 It selects X6h by default and preserves the input dimensions; resize images wider than the print head before conversion. PNG decoding and encoding are enabled by a development dependency for this example, not by the library's `image` feature.
 
-Raster width must fill whole bytes (a multiple of eight for Mono or two for Gray4); rows must be complete and nonempty, with at most 32,768 rows and 16,777,216 pixels. Source images may have odd widths; positioning leaves the remaining output pixels white. Construction validates these limits before allocating conversion buffers. Image conversion produces a buffered raster, not a lazy streaming adapter; Gray4 quantizes directly into that buffer without a grayscale scratch image. Raster validation does not validate all future compression: a late encoding error can occur after earlier rows were submitted.
+Raster width must be a multiple of eight for Mono or two for Gray4. Rows must be complete and nonempty, with at most 32,768 rows and 16,777,216 pixels. Source images may have odd widths; unused output columns remain white. Dimension limits are checked before allocating conversion buffers.
 
-Use `width()`, `height()`, `format()`, and `packed()` to inspect pixels; `into_packed()` consumes the raster and moves out its original buffer. `rows()` creates a forward-only borrowed source. Sources that generate rows or read another medium can implement `RowSource` without a page-sized buffer.
+Image conversion returns a buffered `Raster`. Compression occurs during printing, so an encoding error can occur after earlier rows have been submitted.
 
-`Dither::rows(width)` creates reusable `RowDither` state without the `image` feature. `apply_row(&mut row)` accepts luminance (0 black, 255 white), producing only 0 or 255. A width mismatch leaves both pixels and state unchanged. `reset()` starts a new page without reallocating. Threshold allocates no error storage; diffusion retains three error rows.
+Use `width()`, `height()`, `format()`, and `packed()` to inspect pixels. `into_packed()` consumes the raster and returns its packed pixels without copying. `rows()` creates a forward-only borrowed source. Sources that generate rows or read another medium can implement `RowSource` without buffering a complete page.
+
+`Dither::rows(width)` creates a reusable `RowDither` without the `image` feature. `apply_row(&mut row)` accepts luminance values from 0 (black) through 255 (white) and produces only 0 or 255. A width mismatch leaves both pixels and state unchanged. `reset()` starts a new image without reallocating.
 
 With the `image` feature, `Dither::apply(&mut image)` processes only the declared image dimensions. Empty images and any trailing bytes in an oversized backing buffer remain unchanged.
 
@@ -182,9 +184,9 @@ Status can reflect a recent notification instead of a new request. While the pri
 
 ## Completion and errors
 
-A successful operation leaves the connection available for another job or query. `PrintReport::completion` describes how the operation finished. Some drivers wait for a fixed interval, while MXW01 waits for a completion message. Neither result guarantees the appearance of the printed paper.
+A successful operation leaves the connection available for another job or query. `PrintReport::completion` describes how the operation finished. Some drivers wait for a fixed interval, while MXW01 waits for a completion message. Neither result guarantees physical print quality.
 
-Invalid source metadata or controls are rejected before row reads or transport I/O and leave the connection usable. After submission begins, source and compression failures disable the connection, even before the first write. Later failures can leave partial output. Communication failures, cancellation, and dropping an active operation also disable further use. A genuine printer condition detected before a write can leave it usable; a source returning the same error cannot. Use `Printer::is_usable()` to decide whether to reconnect.
+Invalid source metadata or controls are rejected before row reads or transport I/O and leave the connection usable. Once printing starts, source and compression errors disable the connection, even before the first write. Errors after submission can leave partial output. Communication errors, cancellation, and dropping an active operation also disable the connection. A condition reported by the printer before any write can leave the connection usable; an error returned by `read_row` cannot. Use `Printer::is_usable()` to decide whether to reconnect.
 
 Always await `Printer::disconnect()` when you finish, including after errors. Previously submitted rows can still print. Meowprint does not retry failed operations automatically.
 
@@ -198,12 +200,10 @@ Native Bluetooth support uses the default `bluetooth` feature. To supply another
 meowprint = { version = "0.1", default-features = false }
 ```
 
-Meowprint requires `std` in every supported configuration; `default-features = false` removes native Bluetooth, not the standard library. There is no `no_std` feature. The minimal production dependencies still include Tokio, `lzokay` with its `std` feature, and `thiserror` with its default `std` feature.
+Meowprint requires `std`, even with `default-features = false`. Disabling default features removes native Bluetooth support; it does not provide `no_std` support.
 
-Printer communication requires Tokio, but the library's production dependency does not require its multithread runtime. The [custom transport example](examples/custom_transport.rs) uses a current-thread runtime, a generated eight-row source, and an in-memory connection. Offline raster conversion and preview need no runtime, but still require `std`.
+Printer communication requires a Tokio runtime; a current-thread runtime is sufficient. See the [custom transport example](examples/custom_transport.rs) for a complete printing and disconnect sequence. Offline raster conversion and preview require `std` but no runtime.
 
-Submission retains at most one image row or a 20-row Gray4 band (3,840 input bytes), plus framing/control and codec state. LZO owns a large fixed dictionary; bounded memory is not a guarantee that a particular microcontroller can fit it. The library still uses `std`, Tokio, and `Send`; this API does not implement a network adapter or establish firmware/hardware compatibility.
-
-Advanced BLE backends can obtain `BleProfile` through `Driver::ble_profile()` without enabling native Bluetooth. Its 16-bit Bluetooth-base UUIDs describe alternative services and control/raster/notification endpoints, not compatibility proof or service priority. Backend setup must find all endpoints within one compatible service, require `WRITE_WITHOUT_RESPONSE` for both writes and `NOTIFY` for notifications, reject ambiguous fully compatible services, and subscribe before creating `Printer`. Control and raster may share a characteristic. Ordinary native callers continue using `Device::connect(driver)`.
+Custom BLE backends can obtain `BleProfile` through `Driver::ble_profile()` without enabling native Bluetooth. Its 16-bit Bluetooth-base UUIDs identify alternative services and control, raster, and notification characteristics. They do not establish compatibility or service priority. Backend setup must find all endpoints within one compatible service, require `WRITE_WITHOUT_RESPONSE` for both write characteristics and `NOTIFY` for notifications, reject multiple compatible services, and subscribe before creating a `Printer`. Control and raster may share a characteristic. For native Bluetooth connections, use `Device::connect(driver)`.
 
 See the [API documentation](https://docs.rs/meowprint) for paper movement, cancellation, and individual controls. The [protocol reference](https://docs.rs/meowprint/latest/meowprint/protocol/index.html) records firmware research for driver development and custom transports.

@@ -123,7 +123,8 @@ pub trait RowSource: Send {
     /// Fill the entire destination with the next packed row.
     ///
     /// The destination contains width/8 bytes for Mono or width/2 for Gray4.
-    /// One future is retained while benign printer events are handled.
+    /// Printer notifications do not restart a pending row read.
+    /// Printer faults and invalid replies abort the operation.
     ///
     /// # Errors
     /// Return an error if the requested row cannot be supplied. Destination
@@ -222,14 +223,14 @@ pub struct PrintReport {
 /// All asynchronous operations require a Tokio runtime.
 ///
 /// [`Self::print`] borrows this printer, its row source, and its controls until
-/// submission settles. Pass `&Default::default()` for driver defaults.
+/// printing completes. Pass `&Default::default()` for driver defaults.
 /// Invalid metadata or controls leave the connection usable without reading rows.
 /// Source or compression errors after submission begins disable the connection,
 /// even before the first write; later errors may leave partial physical output.
 /// After a successful print, query, or paper movement, you can reuse this printer.
 ///
 /// Communication failures and dropping an active operation disable further use.
-/// A known printer condition rejected before a write leaves the connection usable.
+/// A condition reported by the printer before any write can leave the connection usable.
 /// Use [`Self::is_usable`] to decide whether to reconnect after an error.
 /// Status reads can report printer conditions without disabling the connection.
 /// Always await [`Self::disconnect`] when you finish, including after errors.

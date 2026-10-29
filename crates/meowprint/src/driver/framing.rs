@@ -24,8 +24,8 @@ pub fn crc8(payload: &[u8]) -> u8 {
 
 /// A decoded command, direction byte, and payload, without the frame header.
 ///
-/// Unknown commands and payloads are preserved. CRC validation depends on the
-/// decoder's policy; a frame alone does not establish its origin.
+/// Unknown commands and payloads are preserved. The decoder applies its configured
+/// CRC policy; a decoded frame does not establish the sender's identity.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Frame {
     /// The family-specific command byte.

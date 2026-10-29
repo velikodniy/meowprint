@@ -21,9 +21,6 @@ pub enum Dither {
 
 impl Dither {
     /// Create a reusable row processor with the given grayscale row width.
-    ///
-    /// Diffusion allocates three reusable error rows once; Threshold allocates
-    /// none. Allocation follows ordinary Rust allocation semantics.
     #[must_use]
     pub fn rows(self, width: usize) -> RowDither {
         RowDither {
@@ -58,7 +55,7 @@ impl Dither {
     }
 }
 
-/// Stateful processor for successive grayscale rows.
+/// Reusable state for dithering successive grayscale rows.
 pub struct RowDither {
     method: Dither,
     width: usize,
@@ -93,9 +90,7 @@ impl RowDither {
         Ok(())
     }
 
-    /// Discard accumulated error and restart left-to-right traversal.
-    ///
-    /// Reuses the existing storage without allocating.
+    /// Reset the processor for a new image without reallocating.
     pub fn reset(&mut self) {
         self.reverse = false;
         for row in &mut self.errors {

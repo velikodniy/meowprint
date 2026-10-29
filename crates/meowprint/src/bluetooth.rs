@@ -224,9 +224,9 @@ impl Device {
 /// Access to native Bluetooth adapters for printer discovery.
 ///
 /// Create one with [`Self::new`], then use [`Self::scan`] to list devices or
-/// [`Self::find`] to select a known name or identifier. Discovery uses all
-/// powered adapters, including those whose backend cannot query the initial
-/// power state. Scan failures are still reported.
+/// [`Self::find`] to select a known name or identifier. Discovery uses powered-on
+/// adapters. Android also accepts an adapter whose initial power state is unknown;
+/// other platforms do not. Scan failures are still reported.
 /// This type does not own an active printer session.
 ///
 /// # Example

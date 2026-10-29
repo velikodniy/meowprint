@@ -1,4 +1,4 @@
-//! Private command-line input and content preparation.
+//! Command-line options and content selection.
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use meowprint::{
     CommonRaw, CommonRawOptions, Driver, Gt01, Gt01Options, MonoEncoding, Mx10, Mx10Options, Mxw01,
@@ -10,50 +10,56 @@ use std::path::PathBuf;
 
 #[derive(Parser)]
 #[command(version, about = "Render and print on Bluetooth thermal printers")]
-/// Parsed command-line input.
+/// Command-line arguments.
 pub struct Cli {
     #[command(subcommand)]
-    /// Selected terminal command.
+    /// Command to run.
     pub command: Command,
 }
 #[derive(Subcommand)]
-/// Supported terminal commands.
+/// Commands supported by the CLI.
 pub enum Command {
     /// Find devices without sending printer commands.
     Scan {
+        /// Include devices that do not match known printer names or services.
         #[arg(long)]
         all: bool,
+        /// Scan duration in seconds.
         #[arg(long, default_value_t = 8, value_parser = clap::value_parser!(u64).range(1..=60))]
         seconds: u64,
     },
     /// Read discovered services without sending printer commands.
     Inspect {
+        /// Exact device name or platform identifier.
         #[arg(long)]
         device: String,
     },
-    /// List explicit reference drivers. Names alone do not prove compatibility.
+    /// List the available reference drivers.
     Drivers,
     /// Save exact rendered pixels without Bluetooth access.
     Preview {
+        /// Output PNG path.
         #[arg(short, long)]
         output: PathBuf,
+        /// Driver used to render the preview.
         #[arg(long, value_enum)]
         driver: DriverArg,
         #[command(subcommand)]
         content: Content,
     },
-    /// Render and print with an explicit reference driver.
+    /// Render content and print it using the selected driver.
     Print {
         #[command(flatten)]
         connection: Connection,
         #[command(flatten)]
         controls: Controls,
+        /// Save a PNG preview before Bluetooth discovery.
         #[arg(long)]
         preview: Option<PathBuf>,
         #[command(subcommand)]
         content: Content,
     },
-    /// Show readable device information for a supported query.
+    /// Read printer status or device information.
     Query {
         #[command(flatten)]
         connection: Connection,
@@ -64,37 +70,39 @@ pub enum Command {
     Feed {
         #[command(flatten)]
         connection: Connection,
+        /// Distance in dot rows.
         #[arg(long, value_parser = clap::value_parser!(u16).range(1..))]
         rows: u16,
     },
-    /// Send observed A0 paper retract. Direction and units need hardware tests.
+    /// Send the observed A0 paper-retract command. Direction and units are unverified.
     Retract {
         #[command(flatten)]
         connection: Connection,
+        /// Number of rows to request.
         #[arg(long, value_parser = clap::value_parser!(u16).range(1..))]
         rows: u16,
     },
-    /// Attempt MXW01 cancellation with the observed AC command, then disconnect.
+    /// Attempt the observed MXW01 AC cancellation command, then disconnect.
     Cancel {
         #[command(flatten)]
         connection: Connection,
     },
 }
 #[derive(Args)]
-/// Explicit device and firmware driver selection.
+/// Printer selection and connection options.
 pub struct Connection {
     #[arg(long)]
     /// Exact device name or platform identifier.
     pub device: String,
     #[arg(long, value_enum)]
-    /// Explicit firmware behavior.
+    /// Firmware driver used to communicate with the printer.
     pub driver: DriverArg,
     #[arg(long, value_enum)]
-    /// MXW01 notification format selected from firmware evidence. Default with-crc.
+    /// MXW01 notification format. Defaults to with-crc.
     pub mxw01_reply_format: Option<ReplyFormatArg>,
 }
 impl Connection {
-    /// Return the selected MXW01 receive format. Reject its use with another driver.
+    /// Select the MXW01 notification format, or return an error if used with another driver.
     pub fn reply_format(&self) -> anyhow::Result<ReplyFormat> {
         if self.mxw01_reply_format.is_some() && !matches!(self.driver, DriverArg::Mxw01) {
             anyhow::bail!("The MXW01 reply format requires the mxw01 driver.");
@@ -106,35 +114,36 @@ impl Connection {
     }
 }
 #[derive(Args, Clone, Default)]
-/// Supported print controls with driver-dependent defaults.
+/// Print controls. Defaults depend on the selected driver.
 pub struct Controls {
-    /// Common thermal energy in native 16-bit units. Default 12000.
+    /// Common thermal energy in 16-bit units. Default: 12000.
     #[arg(long, conflicts_with = "intensity")]
     energy: Option<u16>,
-    /// MXW01 darkness in byte units. Default 93.
+    /// MXW01 print intensity in byte units. Default: 93.
     #[arg(long)]
     intensity: Option<u8>,
-    /// Common motor divisor. Smaller is faster. Default 30, or 10 for V5G.
+    /// Common motor speed divisor. Smaller values are faster. Default: 30 (10 for V5G).
     #[arg(long)]
     speed: Option<u8>,
     /// Total final paper movement in dot rows. Zero suppresses final feed.
     #[arg(long)]
     feed: Option<u16>,
-    /// Final feed speed divisor. Default 25.
+    /// Final feed speed divisor. Default: 25.
     #[arg(long)]
     feed_speed: Option<u8>,
-    /// Common quality from 1 through 5. Default 3.
+    /// Common print quality, from 1 to 5. Default: 3.
     #[arg(long, conflicts_with = "concentration")]
     quality: Option<u8>,
-    /// X6h concentration: 1 darkest, 3 normal, 5 lightest.
+    /// X6h print concentration: 1 is darkest, 3 is normal, 5 is lightest.
     #[arg(long)]
     concentration: Option<u8>,
-    /// X6h density from 0 through 200, or V5G density from 1 through 200.
+    /// Density range: 0–200 for X6h, 1–200 for V5G.
     #[arg(long)]
     density: Option<u8>,
+    /// Print mode for the selected firmware.
     #[arg(long, value_enum)]
     mode: Option<ModeArg>,
-    /// Override driver encoding. Zlib and V5G bands need hardware tests.
+    /// Select an encoding. Zlib and V5G band encoding require hardware testing.
     #[arg(long, value_enum)]
     encoding: Option<EncodingArg>,
 }
@@ -167,7 +176,7 @@ impl Controls {
         Ok(())
     }
 }
-/// Convert terminal flags at the boundary to a driver's typed controls.
+/// Convert CLI controls to the selected driver's options.
 pub trait CliDriver: Driver {
     fn options(controls: Controls) -> anyhow::Result<Self::Options>;
 }
@@ -233,23 +242,29 @@ options!(X6h, X6hOptions; energy, speed, feed, feed_speed, concentration, densit
 options!(V5g, V5gOptions; energy, speed, feed, feed_speed, quality, density; mode; encoding => band_encoding);
 options!(Mxw01, Mxw01Options; intensity;;);
 #[derive(Subcommand)]
-/// Content that the binary can render.
+/// Content types the CLI can render.
 pub enum Content {
+    /// Render an image file.
     Image {
+        /// Source image file.
         path: PathBuf,
+        /// Monochrome conversion method.
         #[arg(long, value_enum, default_value_t = DitherArg::Ostromoukhov)]
         dither: DitherArg,
-        /// Render sixteen gray levels for X6h or V5G, with exact preview pixels.
+        /// Render sixteen gray levels for X6h or V5G.
         #[arg(long)]
         grayscale: bool,
     },
+    /// Render literal text or a UTF-8 text file.
     Text(TextArgs),
+    /// Render a QR code.
     Qr {
+        /// Data to encode in the QR code.
         content: String,
     },
 }
 #[derive(Args)]
-/// Text files, fonts, and dimensions in dots.
+/// Text content, font, and dimensions.
 pub struct TextArgs {
     #[arg(required_unless_present = "file", conflicts_with = "file")]
     /// Literal text when no file is selected.
@@ -257,14 +272,14 @@ pub struct TextArgs {
     #[arg(long)]
     /// UTF-8 text file path.
     pub file: Option<PathBuf>,
-    /// TrueType or OpenType font path. Default: embedded Roboto Regular.
+    /// TrueType or OpenType font path. Defaults to the embedded Roboto Regular font.
     #[arg(long)]
     pub font: Option<PathBuf>,
     #[arg(long, default_value_t = 28.0)]
-    /// Font size in dots, default 28.
+    /// Font size in dots.
     pub size: f32,
     #[arg(long, default_value_t = 12)]
-    /// Margin on all sides in dots, default 12.
+    /// Margin on all sides in dots.
     pub margin: u32,
 }
 #[derive(Clone, Copy, ValueEnum)]
@@ -277,11 +292,11 @@ pub enum DitherArg {
 }
 macro_rules! drivers {
     ($format:ident; $($name:ident => $driver:expr),* $(,)?) => {
-        /// Stable terminal names for the built-in drivers.
+        /// Names of the built-in drivers.
         #[derive(Clone, Copy, ValueEnum)]
         pub enum DriverArg { $($name),* }
         impl DriverArg {
-            /// Resolve runtime selection once, then run a typed operation.
+            /// Execute a command with this driver.
             pub async fn execute(self, command: Command) -> anyhow::Result<()> {
                 let $format = match &command {
                     Command::Print { connection, .. } | Command::Query { connection, .. }
@@ -307,7 +322,7 @@ enum ModeArg {
     Label,
 }
 #[derive(Clone, Copy, ValueEnum)]
-/// MXW01 notification framing choices.
+/// MXW01 notification formats.
 pub enum ReplyFormatArg {
     WithCrc,
     WithoutCrc,
@@ -321,7 +336,7 @@ enum EncodingArg {
     ZlibExperimental,
 }
 #[derive(Clone, Copy, ValueEnum)]
-/// Supported device query names.
+/// Printer queries.
 pub enum QueryArg {
     Status,
     #[value(alias = "version")]

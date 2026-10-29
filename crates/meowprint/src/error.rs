@@ -3,13 +3,13 @@
 /// An error from pixel input, encoding, Bluetooth access, or a printer operation.
 ///
 /// Invalid source metadata or controls leave a [`Printer`](crate::Printer) usable.
-/// Once submission begins, source or compression failures disable the connection,
-/// even before the first write. Communication failures also disable it. A genuine
-/// printer condition rejected before a write leaves it usable. Any error after
-/// a write attempt disables the connection. Previously submitted rows can still print.
+/// Source or compression failures after submission begins disable the connection,
+/// even before the first write. Communication failures also disable it. A printer
+/// condition rejected before a write leaves it usable. Errors after a write attempt
+/// disable the connection; previously submitted rows may still print.
 ///
-/// No operation is retried automatically. See [`Printer::is_usable`](crate::Printer::is_usable)
-/// for connection state and [`Printer::disconnect`](crate::Printer::disconnect) for explicit cleanup.
+/// Operations are not retried automatically. See [`Printer::is_usable`](crate::Printer::is_usable)
+/// for connection state and [`Printer::disconnect`](crate::Printer::disconnect) to close it.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     /// An input value is invalid or the requested operation is unsupported.

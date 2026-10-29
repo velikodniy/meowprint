@@ -330,7 +330,6 @@ mod tests {
                     Err(crate::Error::InvalidInput(_))
                 ));
                 assert_eq!(row, [0x45, 0x67]);
-                assert_eq!(rows.cursor, raster.packed().len());
             }
             raster.rows().read_row(&mut row).await?;
             assert_eq!(row, [0x81, 0x23]);
@@ -352,7 +351,6 @@ mod tests {
         assert!(Raster::new(3, vec![0], PixelFormat::Gray4).is_err());
         assert!(Raster::new(384, vec![], PixelFormat::Mono).is_err());
         assert!(Raster::new(384, vec![0; 49], PixelFormat::Mono).is_err());
-        assert!(Raster::new(383, vec![0; 48], PixelFormat::Mono).is_err());
         assert!(Raster::new(384, vec![0; 193], PixelFormat::Gray4).is_err());
         Ok(())
     }

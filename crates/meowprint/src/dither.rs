@@ -449,11 +449,16 @@ mod tests {
             assert_eq!(actual, expected);
             state.reset();
             let mut fresh = method.rows(7);
-            let mut reset_row = [0, 41, 80, 120, 160, 210, 255];
-            let mut fresh_row = reset_row;
-            state.apply_row(&mut reset_row)?;
-            fresh.apply_row(&mut fresh_row)?;
-            assert_eq!(reset_row, fresh_row);
+            for mut reset_row in [
+                [0, 41, 80, 120, 160, 210, 255],
+                [17, 37, 57, 77, 97, 117, 137],
+                [255, 210, 160, 120, 80, 41, 0],
+            ] {
+                let mut fresh_row = reset_row;
+                state.apply_row(&mut reset_row)?;
+                fresh.apply_row(&mut fresh_row)?;
+                assert_eq!(reset_row, fresh_row);
+            }
         }
         Ok(())
     }

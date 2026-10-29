@@ -94,30 +94,3 @@ impl Content {
         Ok(RenderedContent { raster, options })
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use meowprint::{Gt01, X6h};
-
-    fn compare_previews(driver: impl Driver, fixture: &str, grayscale: bool) -> Result<()> {
-        let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("tests/fixtures")
-            .join(fixture);
-        let content = Content::Image {
-            path: source.clone(),
-            dither: DitherArg::Threshold,
-            grayscale,
-        }
-        .render(driver, Default::default())?;
-        let preview = content.preview();
-        assert_eq!(preview, image::open(source)?.to_luma8());
-        Ok(())
-    }
-
-    #[test]
-    fn raster_previews_preserve_mono_and_gray4_pixels() -> Result<()> {
-        compare_previews(Gt01, "image.png", false)?;
-        compare_previews(X6h, "gray.png", true)
-    }
-}

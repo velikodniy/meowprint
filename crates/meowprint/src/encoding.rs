@@ -138,7 +138,7 @@ mod tests {
     }
 
     #[test]
-    fn rle_reports_equal_size_and_overflow_without_writing_past_window() {
+    fn rle_reports_equal_size_and_output_exhaustion() {
         let equal: Vec<u8> = (0..48).map(|i| if i % 2 == 0 { 0xff } else { 0 }).collect();
         let mut output = [0; 48];
         assert_eq!(rle_into(&equal, &mut output), Some(48));

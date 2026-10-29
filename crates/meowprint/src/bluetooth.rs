@@ -100,19 +100,21 @@ pub struct Device {
 impl Device {
     async fn from_peripheral(peripheral: Peripheral, adapter: Adapter) -> Result<Self> {
         let properties = bounded("device properties", peripheral.properties()).await?;
+        let (name, rssi, advertised_services, manufacturer_data) = match properties {
+            Some(p) => (
+                p.local_name.or(p.advertisement_name),
+                p.rssi,
+                p.services,
+                p.manufacturer_data,
+            ),
+            None => (None, None, Vec::new(), HashMap::new()),
+        };
         Ok(Self {
             id: peripheral.id().to_string(),
-            name: properties.as_ref().and_then(|p| {
-                p.local_name
-                    .clone()
-                    .or_else(|| p.advertisement_name.clone())
-            }),
-            rssi: properties.as_ref().and_then(|p| p.rssi),
-            advertised_services: properties
-                .as_ref()
-                .map(|p| p.services.clone())
-                .unwrap_or_default(),
-            manufacturer_data: properties.map(|p| p.manufacturer_data).unwrap_or_default(),
+            name,
+            rssi,
+            advertised_services,
+            manufacturer_data,
             peripheral,
             adapter,
         })
@@ -181,11 +183,6 @@ impl Device {
     /// Return connection, discovery, subscription, or timeout errors. Missing or
     /// ambiguous services required by the driver also cause an error.
     pub async fn connect<D: Driver>(self, driver: D) -> Result<Printer<BleTransport, D>> {
-        let transport = self.connect_transport(driver).await?;
-        Ok(Printer::new(transport, driver))
-    }
-
-    async fn connect_transport<D: Driver>(self, driver: D) -> Result<BleTransport> {
         let mut cleanup = connection_cleanup(&self.peripheral, &self.adapter);
         let mut result = async {
             let central_events = bounded("Bluetooth events", self.adapter.events()).await?;
@@ -220,7 +217,7 @@ impl Device {
                 let _ = cleanup.finish().await;
             }
         }
-        result
+        Ok(Printer::new(result?, driver))
     }
 }
 

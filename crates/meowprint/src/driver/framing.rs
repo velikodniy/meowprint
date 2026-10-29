@@ -84,12 +84,10 @@ pub fn finish_into(
     max_payload: usize,
     output: &mut [u8],
 ) -> Result<usize> {
-    validate_payload(payload_len, max_payload)?;
+    let len = validate_payload(payload_len, max_payload)?;
     if output.len() < payload_len + 8 {
         return Err(invalid("The frame output buffer is too small."));
     }
-    let len = u16::try_from(payload_len)
-        .map_err(|_| invalid("A frame cannot exceed 65535 payload bytes."))?;
     output[..2].copy_from_slice(&header);
     output[2] = command;
     output[3] = direction;
@@ -99,15 +97,15 @@ pub fn finish_into(
     Ok(payload_len + 8)
 }
 
-fn validate_payload(payload_len: usize, max_payload: usize) -> Result<()> {
-    u16::try_from(payload_len)
+fn validate_payload(payload_len: usize, max_payload: usize) -> Result<u16> {
+    let len = u16::try_from(payload_len)
         .map_err(|_| invalid("A frame cannot exceed 65535 payload bytes."))?;
     if payload_len > max_payload {
         return Err(invalid(
             "The frame exceeds the selected driver payload limit.",
         ));
     }
-    Ok(())
+    Ok(len)
 }
 
 /// An incremental reply parser with a driver-selected header and CRC policy.
@@ -282,15 +280,30 @@ mod tests {
     }
 
     #[test]
-    fn finish_into_matches_encode_and_checks_output_limits() -> crate::Result<()> {
-        let payload = [1, 2, 3, 4];
-        let mut output = [0; 12];
-        output[6..10].copy_from_slice(&payload);
-        let len = super::finish_into([0x51, 0x78], 0xa1, 0, payload.len(), 4, &mut output)?;
-        assert_eq!(len, 12);
-        assert_eq!(output.to_vec(), encode([0x51, 0x78], 0xa1, 0, &payload, 4)?);
-        assert!(super::finish_into([0; 2], 0, 0, 4, 4, &mut [0; 11]).is_err());
-        assert!(super::finish_into([0; 2], 0, 0, 5, 4, &mut [0; 13]).is_err());
+    fn finish_into_preserves_wire_bytes_and_checks_output_limits() -> crate::Result<()> {
+        let mut output = [0; 9];
+        output[6] = 0x10;
+        let len = super::finish_into([0x51, 0x78], 0xae, 1, 1, 1, &mut output)?;
+        assert_eq!(len, 9);
+        assert_eq!(output, [0x51, 0x78, 0xae, 1, 1, 0, 0x10, 0x70, 0xff]);
+
+        for (payload_len, max_payload, capacity) in
+            [(4, 4, 11), (5, 4, 13), (65_536, 65_536, 65_544)]
+        {
+            let mut output = vec![0x5a; capacity];
+            let before = output.clone();
+            assert!(
+                super::finish_into([0; 2], 0, 0, payload_len, max_payload, &mut output).is_err()
+            );
+            assert_eq!(output, before);
+        }
+
+        let mut output = vec![0; 65_535 + 8];
+        let len = super::finish_into([0x51, 0x78], 0xae, 1, 65_535, 65_536, &mut output)?;
+        assert_eq!(len, 65_535 + 8);
+        assert_eq!(&output[..6], &[0x51, 0x78, 0xae, 1, 0xff, 0xff]);
+        assert!(output[6..6 + 65_535].iter().all(|&byte| byte == 0));
+        assert_eq!(&output[len - 2..], &[0, 0xff]);
         Ok(())
     }
 }

@@ -166,7 +166,10 @@ impl Spec {
         }
         Ok(encoding)
     }
-    fn commands(self, commands: Vec<Command<'_>>) -> Result<Vec<EncodedCommand>> {
+    fn commands<'a>(
+        self,
+        commands: impl IntoIterator<Item = Command<'a>>,
+    ) -> Result<Vec<EncodedCommand>> {
         commands
             .into_iter()
             .map(|command| command.prepare(self.max_payload))
@@ -189,8 +192,7 @@ impl Spec {
                 distances
                     .into_iter()
                     .filter(|&rows| rows != 0)
-                    .map(Command::Feed)
-                    .collect(),
+                    .map(Command::Feed),
             )?,
         ))
     }
@@ -201,9 +203,7 @@ impl Spec {
             ));
         }
         if retract {
-            Ok(Movement::Commands(
-                self.commands(vec![Command::Retract(rows)])?,
-            ))
+            Ok(Movement::Commands(self.commands([Command::Retract(rows)])?))
         } else {
             self.feed(rows, false)
         }
@@ -255,7 +255,7 @@ impl Spec {
         let blank = encoder.encode(1)?.to_vec();
         Ok(Stream {
             start: self.commands(start)?,
-            before_feed: self.commands(vec![Command::Speed(options.feed_speed)])?,
+            before_feed: self.commands([Command::Speed(options.feed_speed)])?,
             feed: self.feed(options.feed, matches!(self.feed, Feed::Split))?,
             end: self.commands(end)?,
             blank,

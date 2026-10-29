@@ -327,33 +327,3 @@ pub enum QueryArg {
     #[value(alias = "version")]
     Info,
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn omitted_flags_use_driver_defaults_and_explicit_zero_is_preserved() -> anyhow::Result<()> {
-        assert_eq!(Gt01::options(Controls::default())?, Gt01Options::default());
-        assert_eq!(Mx10::options(Controls::default())?, Mx10Options::default());
-        assert_eq!(V5g::options(Controls::default())?, V5gOptions::default());
-        assert_eq!(
-            Mxw01::options(Controls::default())?,
-            Mxw01Options::default()
-        );
-        let controls = Controls {
-            feed: Some(0),
-            energy: Some(0),
-            ..Controls::default()
-        };
-        let options = Gt01::options(controls)?;
-        assert_eq!(options.feed, 0);
-        assert_eq!(options.energy, 0);
-        assert_eq!(options.speed, 30);
-        let options = X6h::options(Controls {
-            density: Some(0),
-            ..Controls::default()
-        })?;
-        assert_eq!(options.density, Some(0));
-        Ok(())
-    }
-}

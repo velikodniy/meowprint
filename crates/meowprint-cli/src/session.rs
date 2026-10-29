@@ -85,12 +85,13 @@ impl<T: Transport, D: Driver, S: Future<Output = io::Result<()>>> Session<T, D, 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::args::Content;
-    use meowprint::{Error, Gt01, Gt01Options, TransportEvent, WriteChannel};
+    use crate::args::{Cli, CliDriver, Command as CliCommand, Content, Controls};
+    use clap::Parser;
+    use meowprint::{Error, Gt01, Gt01Options, TransportEvent, WriteChannel, X6h};
     use std::{
         future::poll_fn,
         sync::{
-            Arc,
+            Arc, Mutex,
             atomic::{AtomicUsize, Ordering},
         },
         task::Poll,
@@ -102,6 +103,7 @@ mod tests {
         writes: AtomicUsize,
         finished_writes: AtomicUsize,
         disconnects: AtomicUsize,
+        control_bytes: Mutex<Vec<u8>>,
     }
 
     #[derive(Default)]
@@ -117,19 +119,23 @@ mod tests {
         fn max_write_size(&self) -> usize {
             120
         }
-
-        async fn write(&mut self, _: WriteChannel, bytes: &[u8]) -> meowprint::Result<()> {
+        async fn write(&mut self, channel: WriteChannel, bytes: &[u8]) -> meowprint::Result<()> {
             self.record.writes.fetch_add(1, Ordering::SeqCst);
             tokio::time::sleep(self.write_delay).await;
             self.record.finished_writes.fetch_add(1, Ordering::SeqCst);
             if self.fail_write {
                 return Err(Error::Transport("operation failed".into()));
             }
-            // Reply to the common-family status query.
+            if channel == WriteChannel::Control {
+                self.record
+                    .control_bytes
+                    .lock()
+                    .map_err(|error| Error::Transport(error.to_string()))?
+                    .extend_from_slice(bytes);
+            }
             self.reply = bytes.starts_with(&[0x51, 0x78, 0xa3]);
             Ok(())
         }
-
         async fn event(&mut self) -> meowprint::Result<TransportEvent> {
             if std::mem::take(&mut self.reply) {
                 return Ok(TransportEvent::Notification(vec![
@@ -138,9 +144,12 @@ mod tests {
             }
             std::future::pending().await
         }
-
         fn disconnect(&mut self) -> impl Future<Output = meowprint::Result<()>> + Send {
-            poll_fn(move |_| {
+            poll_fn(|_| {
+                assert_eq!(
+                    self.record.writes.load(Ordering::SeqCst),
+                    self.record.finished_writes.load(Ordering::SeqCst)
+                );
                 self.record.disconnects.fetch_add(1, Ordering::SeqCst);
                 if self.fail_disconnect {
                     return Poll::Ready(Err(Error::Transport("disconnect failed".into())));
@@ -161,29 +170,161 @@ mod tests {
         .render(Gt01, Gt01Options::default())
     }
 
+    fn command_payloads(bytes: &[u8], command: u8) -> Vec<&[u8]> {
+        let mut payloads = Vec::new();
+        let mut position = 0;
+        while position < bytes.len() {
+            assert!(position + 8 <= bytes.len());
+            assert_eq!(&bytes[position..position + 2], &[0x51, 0x78]);
+            let payload_len = usize::from(u16::from_le_bytes([
+                bytes[position + 4],
+                bytes[position + 5],
+            ]));
+            let end = position + payload_len + 8;
+            assert!(end <= bytes.len());
+            if bytes[position + 2] == command {
+                payloads.push(&bytes[position + 6..position + 6 + payload_len]);
+            }
+            position = end;
+        }
+        payloads
+    }
+
+    fn parsed_print(args: &[&str]) -> Result<(Controls, Content)> {
+        match Cli::try_parse_from(args)?.command {
+            CliCommand::Print {
+                controls, content, ..
+            } => Ok((controls, content)),
+            _ => anyhow::bail!("Expected a print command."),
+        }
+    }
+
+    fn snapshot(record: &Record) -> Result<(usize, Vec<u8>)> {
+        Ok((
+            record.writes.load(Ordering::SeqCst),
+            record
+                .control_bytes
+                .lock()
+                .map_err(|error| anyhow::anyhow!("{error}"))?
+                .clone(),
+        ))
+    }
+
     #[tokio::test(start_paused = true)]
-    async fn connected_commands_disconnect_after_success() -> Result<()> {
+    async fn explicit_zero_controls_reach_printed_commands() -> Result<()> {
+        let (controls, content) = parsed_print(&[
+            "cli", "print", "--device", "p", "--driver", "gt01", "--feed", "0", "--energy", "0",
+            "qr", "x",
+        ])?;
+        let options = Gt01::options(controls)?;
         let script = Script::default();
         let record = Arc::clone(&script.record);
-        let content = content()?;
-        let (_, height) = content.dimensions();
-        let report = session(script).print(content).await?;
+        Session::new(Printer::new(script, Gt01), std::future::pending())
+            .print(content.render(Gt01, options)?)
+            .await?;
+        let (_, bytes) = snapshot(&record)?;
+        assert_eq!(command_payloads(&bytes, 0xaf), vec![&[0, 0][..]]);
+        assert_eq!(command_payloads(&bytes, 0xa1), [] as [&[u8]; 0]);
+        assert_eq!(record.disconnects.load(Ordering::SeqCst), 1);
+
+        for (args, expected) in [
+            (
+                vec![
+                    "cli", "print", "--device", "p", "--driver", "x6h", "qr", "x",
+                ],
+                None,
+            ),
+            (
+                vec![
+                    "cli",
+                    "print",
+                    "--device",
+                    "p",
+                    "--driver",
+                    "x6h",
+                    "--density",
+                    "0",
+                    "qr",
+                    "x",
+                ],
+                Some(&[1, 0][..]),
+            ),
+        ] {
+            let (controls, content) = parsed_print(&args)?;
+            let driver = X6h;
+            let options = X6h::options(controls)?;
+            let script = Script::default();
+            let record = Arc::clone(&script.record);
+            Session::new(Printer::new(script, driver), std::future::pending())
+                .print(content.render(driver, options)?)
+                .await?;
+            let (_, bytes) = snapshot(&record)?;
+            let payloads = command_payloads(&bytes, 0xf2);
+            match expected {
+                None => assert_eq!(payloads, [] as [&[u8]; 0]),
+                Some(payload) => assert_eq!(payloads, vec![payload]),
+            }
+            assert_eq!(record.disconnects.load(Ordering::SeqCst), 1);
+        }
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn connected_commands_disconnect_after_success() -> Result<()> {
+        let baseline = content()?;
+        let (_, height) = baseline.dimensions();
+        let script = Script::default();
+        let record = Arc::clone(&script.record);
+        let report = session(script).print(baseline).await?;
         assert_eq!(report.image_rows, height);
-        assert!(report.bytes_submitted > 0);
+        let expected = snapshot(&record)?;
+        assert_eq!(record.disconnects.load(Ordering::SeqCst), 1);
+        let script = Script {
+            fail_disconnect: true,
+            ..Script::default()
+        };
+        let record = Arc::clone(&script.record);
+        let err = session(script).print(content()?).await.err();
+        assert!(
+            matches!(err.as_ref().and_then(|error| error.downcast_ref::<Error>()), Some(Error::Transport(s)) if s == "disconnect failed")
+        );
+        assert_eq!(snapshot(&record)?, expected);
         assert_eq!(record.disconnects.load(Ordering::SeqCst), 1);
 
         let script = Script::default();
         let record = Arc::clone(&script.record);
         let output = session(script).query(QueryArg::Status).await?;
-        assert!(output.contains("State: ready"), "{output}");
+        assert_eq!(output, "State: ready");
+        let expected = snapshot(&record)?;
         assert_eq!(record.disconnects.load(Ordering::SeqCst), 1);
-
+        let script = Script {
+            fail_disconnect: true,
+            ..Script::default()
+        };
+        let record = Arc::clone(&script.record);
+        let err = session(script).query(QueryArg::Status).await.err();
+        assert!(
+            matches!(err.as_ref().and_then(|error| error.downcast_ref::<Error>()), Some(Error::Transport(s)) if s == "disconnect failed")
+        );
+        assert_eq!(snapshot(&record)?, expected);
+        assert_eq!(record.disconnects.load(Ordering::SeqCst), 1);
         for retract in [false, true] {
             let script = Script::default();
             let record = Arc::clone(&script.record);
             let report = session(script).movement(1, retract).await?;
             assert_eq!(report.image_rows, 0);
-            assert!(report.bytes_submitted > 0);
+            let expected = snapshot(&record)?;
+            assert_eq!(record.disconnects.load(Ordering::SeqCst), 1);
+            let script = Script {
+                fail_disconnect: true,
+                ..Script::default()
+            };
+            let record = Arc::clone(&script.record);
+            let err = session(script).movement(1, retract).await.err();
+            assert!(
+                matches!(err.as_ref().and_then(|error| error.downcast_ref::<Error>()), Some(Error::Transport(s)) if s == "disconnect failed")
+            );
+            assert_eq!(snapshot(&record)?, expected);
             assert_eq!(record.disconnects.load(Ordering::SeqCst), 1);
         }
         Ok(())
@@ -197,38 +338,12 @@ mod tests {
             ..Script::default()
         };
         let record = Arc::clone(&script.record);
-        let result = session(script).query(QueryArg::Status).await;
-        let error = result.err().map(|error| format!("{error:#}"));
+        let error = session(script).query(QueryArg::Status).await.err();
         assert!(
-            error
-                .as_deref()
-                .is_some_and(|error| error.contains("operation failed")),
-            "{error:?}"
-        );
-        assert!(
-            !error
-                .as_deref()
-                .is_some_and(|error| error.contains("disconnect failed"))
+            matches!(error.as_ref().and_then(|error| error.downcast_ref::<Error>()), Some(Error::Transport(s)) if s == "operation failed")
         );
         assert_eq!(record.writes.load(Ordering::SeqCst), 1);
-        assert!(record.disconnects.load(Ordering::SeqCst) > 0);
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn disconnect_failure_retains_the_successful_command_context() {
-        let result = session(Script {
-            fail_disconnect: true,
-            ..Script::default()
-        })
-        .query(QueryArg::Status)
-        .await;
-        let error = result.err().map(|error| format!("{error:#}"));
-        assert!(
-            error
-                .as_deref()
-                .is_some_and(|error| error.contains("The query succeeded, but disconnect failed.")),
-            "{error:?}"
-        );
+        assert_eq!(record.disconnects.load(Ordering::SeqCst), 2);
     }
 
     #[tokio::test(start_paused = true)]
@@ -237,16 +352,16 @@ mod tests {
         let record = Arc::clone(&script.record);
         let printer = Printer::new(script, Gt01);
         printer.cancellation().cancel();
-        let result = Session::new(printer, std::future::pending::<io::Result<()>>())
+        let error = Session::new(printer, std::future::pending::<io::Result<()>>())
             .print(content()?)
-            .await;
-        let error = result.err().map(|error| format!("{error:#}"));
-        assert!(
+            .await
+            .err();
+        assert!(matches!(
             error
-                .as_deref()
-                .is_some_and(|error| error.contains("unknown outcome")),
-            "{error:?}"
-        );
+                .as_ref()
+                .and_then(|error| error.downcast_ref::<Error>()),
+            Some(Error::UnusableConnection)
+        ));
         assert_eq!(record.writes.load(Ordering::SeqCst), 0);
         assert_eq!(record.disconnects.load(Ordering::SeqCst), 1);
         Ok(())
@@ -268,26 +383,25 @@ mod tests {
                     Ok(())
                 }
             };
-            let result = Session::new(Printer::new(script, Gt01), signal)
+            let error = Session::new(Printer::new(script, Gt01), signal)
                 .print(content()?)
-                .await;
-            let error = result.err();
+                .await
+                .err();
             if fail_signal {
                 assert!(
-                    error.as_ref().is_some_and(|error| format!("{error:#}")
-                        .contains("Cannot listen for Ctrl-C. Submission stopped.")),
-                    "{error:?}"
+                    error
+                        .as_ref()
+                        .and_then(|error| error.downcast_ref::<io::Error>())
+                        .is_some_and(|error| error.kind() == io::ErrorKind::Other
+                            && error.to_string() == "signal failed")
                 );
             } else {
-                assert!(
-                    matches!(
-                        error
-                            .as_ref()
-                            .and_then(|error| error.downcast_ref::<Error>()),
-                        Some(Error::Cancelled)
-                    ),
-                    "{error:?}"
-                );
+                assert!(matches!(
+                    error
+                        .as_ref()
+                        .and_then(|error| error.downcast_ref::<Error>()),
+                    Some(Error::Cancelled)
+                ));
             }
             assert_eq!(record.writes.load(Ordering::SeqCst), 1);
             assert_eq!(record.finished_writes.load(Ordering::SeqCst), 1);

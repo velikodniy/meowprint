@@ -149,7 +149,7 @@ impl<T: Transport, D: Driver> Operation<'_, T, D> {
             self.session.state = ConnectionState::Ready;
         } else {
             if matches!(result, Err(Error::Cancelled)) {
-                let _ = self.send_cancel().await;
+                let _ = self.cancel().await;
             }
             let cleanup = self.session.disconnect().await;
             if result.is_ok() {
@@ -158,9 +158,6 @@ impl<T: Transport, D: Driver> Operation<'_, T, D> {
         }
         result
     }
-    pub(crate) async fn cancel(&mut self) -> Result<()> {
-        self.send_cancel().await
-    }
     fn cancelled(&self) -> Result<()> {
         if self.session.cancellation.is_cancelled() {
             Err(Error::Cancelled)
@@ -168,7 +165,7 @@ impl<T: Transport, D: Driver> Operation<'_, T, D> {
             Ok(())
         }
     }
-    async fn send_cancel(&mut self) -> Result<()> {
+    pub(crate) async fn cancel(&mut self) -> Result<()> {
         let Some(command) = self.driver.cancel_command()? else {
             return Ok(());
         };
@@ -1176,17 +1173,6 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn cancellation_during_write_stops_further_common_submission() -> Result<()> {
-        let mut printer = Printer::new(Script::default(), Gt01);
-        printer.session.transport.cancel_at = Some((1, printer.cancellation()));
-        assert!(matches!(print(&mut printer).await, Err(Error::Cancelled)));
-        assert_eq!(printer.session.transport.writes.len(), 1);
-        assert_eq!(printer.session.transport.disconnects, 1);
-        assert!(!printer.is_usable());
-        Ok(())
-    }
-
-    #[tokio::test(start_paused = true)]
     async fn mxw01_finishes_control_frame_before_sending_cancellation() -> Result<()> {
         let mut printer = Printer::new(
             Script {
@@ -1266,6 +1252,8 @@ mod tests {
         assert!(matches!(print(&mut printer).await, Err(Error::Cancelled)));
         assert_eq!(printer.session.transport.writes.len(), 1);
         assert_eq!(tokio::time::Instant::now() - start, delay);
+        assert_eq!(printer.session.transport.disconnects, 1);
+        assert!(!printer.is_usable());
         Ok(())
     }
 

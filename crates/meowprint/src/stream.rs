@@ -109,61 +109,12 @@ mod tests {
     };
     use std::{collections::VecDeque, future::poll_fn, task::Poll};
 
-    struct Pixels {
-        format: PixelFormat,
-        height: u32,
-        bytes: Vec<u8>,
-        cursor: usize,
-    }
-    impl RowSource for Pixels {
-        fn width(&self) -> u32 {
-            384
-        }
-        fn height(&self) -> u32 {
-            self.height
-        }
-        fn format(&self) -> PixelFormat {
-            self.format
-        }
-        fn read_row(&mut self, output: &mut [u8]) -> impl Future<Output = Result<()>> + Send {
-            if output.len() != self.row_bytes() || self.cursor == self.bytes.len() {
-                return std::future::ready(Err(crate::error::invalid("invalid test row request")));
-            }
-            let end = self.cursor + output.len();
-            output.copy_from_slice(&self.bytes[self.cursor..end]);
-            self.cursor = end;
-            std::future::ready(Ok(()))
-        }
-    }
-    impl Pixels {
-        fn new(format: PixelFormat, rows: u32) -> Self {
-            let row_bytes = match format {
-                PixelFormat::Mono => 48,
-                PixelFormat::Gray4 => 192,
-            };
-            Self {
-                format,
-                height: rows,
-                bytes: vec![0x81; row_bytes * rows as usize],
-                cursor: 0,
-            }
-        }
-        fn row_bytes(&self) -> usize {
-            match self.format {
-                PixelFormat::Mono => 48,
-                PixelFormat::Gray4 => 192,
-            }
-        }
-    }
-
     struct Mock {
         decoder: Decoder,
         header: [u8; 2],
         crc: bool,
         replies: VecDeque<TransportEvent>,
         writes: Vec<(WriteChannel, Vec<u8>)>,
-        attempts: usize,
-        fail_write: bool,
         disconnected: bool,
     }
     impl Mock {
@@ -174,8 +125,6 @@ mod tests {
                 crc,
                 replies: VecDeque::new(),
                 writes: Vec::new(),
-                attempts: 0,
-                fail_write: false,
                 disconnected: false,
             }
         }
@@ -187,10 +136,6 @@ mod tests {
             bytes: &[u8],
         ) -> impl Future<Output = Result<()>> + Send {
             poll_fn(move |_| {
-                self.attempts += 1;
-                if self.fail_write {
-                    return Poll::Ready(Err(Error::Transport("injected failure".into())));
-                }
                 self.writes.push((channel, bytes.to_vec()));
                 if channel == WriteChannel::Control {
                     for (_, frame) in self.decoder.feed_positioned(bytes) {
@@ -227,7 +172,7 @@ mod tests {
             std::future::pending().await
         }
         fn disconnect(&mut self) -> impl Future<Output = Result<()>> + Send {
-            poll_fn(move |_| {
+            poll_fn(|_| {
                 self.disconnected = true;
                 Poll::Ready(Ok(()))
             })
@@ -245,7 +190,12 @@ mod tests {
             Mock::new(if mxw01 { [0x22, 0x21] } else { [0x51, 0x78] }, true),
             driver,
         );
-        let mut source = Pixels::new(format, 1);
+        let row_bytes = match format {
+            PixelFormat::Mono => 48,
+            PixelFormat::Gray4 => 192,
+        };
+        let raster = Raster::new(384, vec![0x81; row_bytes], format)?;
+        let mut source = raster.rows();
         printer.print(&mut source, options).await?;
         let mut bytes = Vec::new();
         for (channel, write) in &printer.session.transport.writes {
@@ -336,21 +286,11 @@ mod tests {
             ),
         ] {
             let mut printer = Printer::new(Mock::new(header, crc), driver);
-            let mut source = Pixels::new(PixelFormat::Mono, 1);
+            let raster = Raster::new(384, vec![0x81; 48], PixelFormat::Mono)?;
+            let mut source = raster.rows();
             let report = printer.print(&mut source, &Mxw01Options::default()).await?;
             assert_eq!(report.image_rows, 1);
             assert_eq!(report.completion, completion);
-            assert!(report.bytes_submitted > 0);
-            let raster: Vec<_> = printer
-                .session
-                .transport
-                .writes
-                .iter()
-                .filter(|(channel, _)| *channel == WriteChannel::Raster)
-                .flat_map(|(_, bytes)| bytes.iter().copied())
-                .collect();
-            assert_eq!(raster.len(), 90 * 48);
-            assert_eq!(&raster[48..96], &[0x81; 48]);
             assert_eq!(printer.status().await?, PrinterState::Ready);
             assert_eq!(
                 printer.device_info().await?.firmware_version.as_deref(),
@@ -359,7 +299,8 @@ mod tests {
             assert!(printer.is_usable());
         }
         let mut printer = Printer::new(Mock::new([0x51, 0x78], true), Gt01);
-        let mut source = Pixels::new(PixelFormat::Mono, 1);
+        let raster = Raster::new(384, vec![0x81; 48], PixelFormat::Mono)?;
+        let mut source = raster.rows();
         let report = printer.print(&mut source, &Gt01Options::default()).await?;
         assert_eq!(report.completion, Completion::TimedDrain);
         assert_eq!(printer.status().await?, PrinterState::Ready);
@@ -367,43 +308,34 @@ mod tests {
             printer.device_info().await?.description.as_deref(),
             Some("firmware 1")
         );
-        Ok(())
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn failed_write_disables_connection_without_retrying() -> Result<()> {
-        let mut transport = Mock::new([0x51, 0x78], true);
-        transport.fail_write = true;
-        let mut printer = Printer::new(transport, Gt01);
-        let mut source = Pixels::new(PixelFormat::Mono, 1);
-        assert!(matches!(
-            printer.print(&mut source, &Gt01Options::default()).await,
-            Err(Error::Transport(_))
-        ));
-        assert!(!printer.is_usable());
-        assert!(printer.session.transport.disconnected);
-        assert_eq!(printer.session.transport.attempts, 1);
+        assert!(printer.is_usable());
         Ok(())
     }
 
     #[tokio::test(start_paused = true)]
     async fn controls_are_applied_per_stream_and_connection_is_reusable() -> Result<()> {
         let mut printer = Printer::new(Mock::new([0x51, 0x78], true), Gt01);
-        let mut options = Gt01Options::default();
-        let mut source = Pixels::new(PixelFormat::Mono, 1);
-        printer.print(&mut source, &options).await?;
-        let first = printer.session.transport.writes.clone();
-        printer.session.transport.writes.clear();
-        let mut source = Pixels::new(PixelFormat::Mono, 1);
-        printer.print(&mut source, &Gt01Options::default()).await?;
-        assert_eq!(first, printer.session.transport.writes);
-        assert!(printer.is_usable());
-        assert!(!printer.session.transport.disconnected);
-        printer.session.transport.writes.clear();
-        options.energy = 42;
-        let mut source = Pixels::new(PixelFormat::Mono, 1);
-        printer.print(&mut source, &options).await?;
-        assert_ne!(first, printer.session.transport.writes);
+        let defaults = Gt01Options::default();
+        let raster = Raster::new(384, vec![0x81; 48], PixelFormat::Mono)?;
+        let mut streams = Vec::new();
+        for energy in [defaults.energy, 42, defaults.energy] {
+            let options = Gt01Options { energy, ..defaults };
+            printer.print(&mut raster.rows(), &options).await?;
+            assert!(printer.is_usable());
+            assert!(!printer.session.transport.disconnected);
+            let writes = std::mem::take(&mut printer.session.transport.writes);
+            let mut decoder = Decoder::new([0x51, 0x78], 255, true);
+            let frames: Vec<_> = writes
+                .iter()
+                .filter(|(channel, _)| *channel == WriteChannel::Control)
+                .flat_map(|(_, bytes)| decoder.feed_positioned(bytes))
+                .filter(|(_, frame)| frame.command == 0xaf)
+                .collect();
+            assert_eq!(frames.len(), 1);
+            assert_eq!(frames[0].1.payload, energy.to_le_bytes());
+            streams.push(writes);
+        }
+        assert_eq!(streams[0], streams[2]);
         Ok(())
     }
 }

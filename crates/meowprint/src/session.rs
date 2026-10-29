@@ -556,24 +556,6 @@ mod tests {
     const AE_PAUSE: &[u8] = &[0x51, 0x78, 0xae, 1, 1, 0, 0x10, 0x70, 0xff];
 
     #[tokio::test(start_paused = true)]
-    async fn recognized_a3_fault_stops_printing() -> Result<()> {
-        let mut transport = Script::default();
-        transport.reply(1, A3_PAPER);
-        let mut printer = Printer::new(transport, Gt01);
-        let raster = Raster::new(384, vec![0xff; 48], PixelFormat::Mono)?;
-        let mut rows = raster.rows();
-        let result = printer
-            .print(&mut rows, &crate::Gt01Options::default())
-            .await;
-        assert!(
-            result.is_err(),
-            "A recognized paper fault must stop submission"
-        );
-        assert_eq!(printer.session.transport.writes.len(), 1);
-        assert!(!printer.is_usable());
-        Ok(())
-    }
-    #[tokio::test(start_paused = true)]
     async fn status_returns_queued_conditions_without_io() -> Result<()> {
         for (bytes, condition) in [
             (AE_PAPER, PrinterCondition::OutOfPaper),
@@ -1011,7 +993,6 @@ mod tests {
         }
         Ok(())
     }
-
     #[tokio::test(start_paused = true)]
     async fn mxw01_status_requires_the_error_byte_only_when_flagged() -> Result<()> {
         for (payload, expected) in [

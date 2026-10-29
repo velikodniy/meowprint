@@ -67,8 +67,7 @@ meowprint query --device MXW01 --driver mxw01 info
 
 The output uses names such as `ready`, `out of paper`, and `overheated`.
 The CLI marks missing information as `unknown`.
-Status includes battery and temperature fields.
-Both remain `unknown` until the firmware units are established.
+Status is a single line such as `State: ready`, with named conditions when reported.
 `version` remains an alias for `info`.
 
 Licensed under MIT.

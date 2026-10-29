@@ -12,7 +12,7 @@
 //! backend or a simulated printer.
 
 use crate::{
-    DeviceInfo, Driver, PixelFormat, PrinterStatus, Result,
+    DeviceInfo, Driver, PixelFormat, PrinterState, Result,
     session::{OperationKind, Session},
 };
 use tokio::sync::watch;
@@ -323,16 +323,16 @@ impl<T: Transport, D: Driver> Printer<T, D> {
     pub async fn disconnect(&mut self) -> Result<()> {
         self.session.disconnect().await
     }
-    /// Read the printer's status, including named conditions and known readings.
+    /// Read the printer's state, including named conditions.
     ///
     /// Return a recent notification when available. While the printer is paused,
     /// return the latest known status. Otherwise, request a fresh status.
     /// A reported printer condition leaves the connection usable.
-    /// Unknown readings are `None`. An unknown state never implies readiness.
+    /// An unknown state never implies readiness.
     ///
     /// # Errors
     /// Communication failures, cancellation, and malformed replies disable the connection.
-    pub async fn status(&mut self) -> Result<PrinterStatus> {
+    pub async fn status(&mut self) -> Result<PrinterState> {
         let mut operation = self.session.begin(self.driver, OperationKind::Observe)?;
         let result = D::status(&mut operation).await;
         operation.finish(result).await

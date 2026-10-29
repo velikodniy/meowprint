@@ -116,9 +116,9 @@
 //!
 //! # Queries, completion, and cleanup
 //!
-//! [`Printer::status`] returns named states and conditions. [`Printer::device_info`]
-//! returns device text and a firmware version when available. Missing or unknown
-//! readings are `None`. An unknown state does not mean that the printer is ready.
+//! [`Printer::status`] returns [`PrinterState`] with named states and conditions.
+//! [`Printer::device_info`] returns device text and a firmware version when available;
+//! missing or unknown fields are `None`. An unknown state never implies readiness.
 //! [`Printer::feed`] moves paper forward on supported drivers.
 //!
 //! After a successful print or query, you can reuse the same printer.
@@ -183,7 +183,7 @@ mod raster;
 mod session;
 mod stream;
 
-pub use device::{DeviceInfo, PrinterCondition, PrinterState, PrinterStatus};
+pub use device::{DeviceInfo, PrinterCondition, PrinterState};
 pub use dither::{Dither, RowDither};
 pub use driver::*;
 pub use error::{Error, Result};

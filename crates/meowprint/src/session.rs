@@ -4,8 +4,8 @@ use crate::driver::{
     framing::{Decoder, EncodedCommand, Frame},
 };
 use crate::{
-    Cancellation, Driver, Error, PrinterCondition, PrinterState, PrinterStatus, Result, RowSource,
-    Transport, TransportEvent, WriteChannel,
+    Cancellation, Driver, Error, PrinterCondition, PrinterState, Result, RowSource, Transport,
+    TransportEvent, WriteChannel,
 };
 
 use std::time::Duration;
@@ -34,7 +34,7 @@ pub struct Session<T> {
     expected_reply: Option<Request>,
     cancellation: Cancellation,
     prefixed_start_sent: bool,
-    status: Option<PrinterStatus>,
+    status: Option<PrinterState>,
 }
 
 #[derive(Clone, Copy)]
@@ -52,7 +52,7 @@ impl ReplyKind {
 }
 pub struct Response {
     pub(crate) frame: Frame,
-    status: Option<PrinterStatus>,
+    status: Option<PrinterState>,
 }
 enum Request {
     Armed(ReplyKind),
@@ -204,9 +204,9 @@ impl<T: Transport, D: Driver> Operation<'_, T, D> {
                 self.session.status = Some(status.clone());
                 self.status_seen = true;
                 if self.kind == OperationKind::Submit
-                    && self.driver.blocks_submission(&frame, &status.state)
+                    && self.driver.blocks_submission(&frame, status)
                 {
-                    failure.get_or_insert_with(|| Error::PrinterUnavailable(status.state.clone()));
+                    failure.get_or_insert_with(|| Error::PrinterUnavailable(status.clone()));
                 }
             }
             match observation.flow {
@@ -317,7 +317,7 @@ impl<T: Transport, D: Driver> Operation<'_, T, D> {
                 return Ok(());
             };
             if self.kind == OperationKind::Observe {
-                return Err(Error::PrinterUnavailable(self.paused_status().state));
+                return Err(Error::PrinterUnavailable(self.paused_status()));
             }
             let deadline = since + PAUSE_TIMEOUT;
             let event = self
@@ -457,7 +457,7 @@ impl<T: Transport, D: Driver> Operation<'_, T, D> {
             }
         }
     }
-    pub(crate) async fn status(&mut self, command: &EncodedCommand) -> Result<PrinterStatus> {
+    pub(crate) async fn status(&mut self, command: &EncodedCommand) -> Result<PrinterState> {
         self.drain_pending().await?;
         if self.session.paused_since.is_some() {
             return Ok(self.paused_status());
@@ -473,22 +473,19 @@ impl<T: Transport, D: Driver> Operation<'_, T, D> {
         &mut self,
         command: &EncodedCommand,
         submitted: &mut usize,
-    ) -> Result<PrinterStatus> {
+    ) -> Result<PrinterState> {
         self.exchange(command, ReplyKind::Status, REPLY_TIMEOUT, submitted)
             .await?
             .status
             .ok_or(Error::InvalidReply("printer status"))
     }
-    fn paused_status(&self) -> PrinterStatus {
-        let mut status = self.session.status.clone().unwrap_or(PrinterStatus {
-            state: PrinterState::Unknown,
-            battery_percent: None,
-            temperature_celsius: None,
-        });
-        if matches!(status.state, PrinterState::Ready | PrinterState::Unknown) {
-            status.state = PrinterState::Conditions(vec![PrinterCondition::Paused]);
+    fn paused_status(&self) -> PrinterState {
+        match &self.session.status {
+            None | Some(PrinterState::Ready | PrinterState::Unknown) => {
+                PrinterState::Conditions(vec![PrinterCondition::Paused])
+            }
+            Some(status) => status.clone(),
         }
-        status
     }
     pub const fn ready_after(&self, marker: u64) -> bool {
         self.session.last_ready_position > marker
@@ -590,7 +587,7 @@ mod tests {
             let mut printer = Printer::new(transport, Gt01);
             let started = tokio::time::Instant::now();
             assert_eq!(
-                printer.status().await?.state,
+                printer.status().await?,
                 PrinterState::Conditions(vec![condition])
             );
             assert_eq!(tokio::time::Instant::now(), started);
@@ -651,7 +648,7 @@ mod tests {
         assert_eq!(printer.session.transport.disconnects, 0);
 
         printer.session.transport.reply(last + 1, &reply);
-        assert_eq!(printer.status().await?.state, PrinterState::Unknown);
+        assert_eq!(printer.status().await?, PrinterState::Unknown);
         Ok(())
     }
 
@@ -695,14 +692,30 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn faults_are_semantic_and_later_ready_cannot_erase_them() -> Result<()> {
         for command in [0xa3, 0xae] {
-            for flags in [1, 2, 4, 8, 0x20, 0x40, 0x13] {
+            for (flags, conditions) in [
+                (1, vec![PrinterCondition::OutOfPaper]),
+                (2, vec![PrinterCondition::CoverOpen]),
+                (4, vec![PrinterCondition::Overheated]),
+                (8, vec![PrinterCondition::LowBattery]),
+                (0x20, vec![PrinterCondition::Unknown]),
+                (0x40, vec![PrinterCondition::Unknown]),
+                (
+                    0x13,
+                    vec![
+                        PrinterCondition::OutOfPaper,
+                        PrinterCondition::CoverOpen,
+                        PrinterCondition::Paused,
+                    ],
+                ),
+            ] {
                 let fault = common(command, &[flags])?;
                 let mut transport = Script::default();
                 transport.reply(1, &[fault, AE_READY.to_vec()].concat());
                 let mut printer = Printer::new(transport, Gt01);
                 assert!(matches!(
                     print(&mut printer).await,
-                    Err(Error::PrinterUnavailable(PrinterState::Conditions(_)))
+                    Err(Error::PrinterUnavailable(PrinterState::Conditions(actual)))
+                        if actual == conditions
                 ));
                 assert_eq!(printer.session.transport.attempts, 1);
                 assert_eq!(printer.session.transport.disconnects, 1);
@@ -747,14 +760,14 @@ mod tests {
         assert!(printer.is_usable());
         assert_eq!(printer.session.transport.attempts, 0);
         printer.session.transport.notify(Duration::ZERO, AE_READY);
-        assert_eq!(printer.status().await?.state, PrinterState::Ready);
+        assert_eq!(printer.status().await?, PrinterState::Ready);
         printer.session.transport.reply(1, A3_PAPER);
         assert_eq!(
-            printer.status().await?.state,
+            printer.status().await?,
             PrinterState::Conditions(vec![PrinterCondition::OutOfPaper])
         );
         printer.session.transport.reply(2, A3_READY);
-        assert_eq!(printer.status().await?.state, PrinterState::Ready);
+        assert_eq!(printer.status().await?, PrinterState::Ready);
         assert_eq!(printer.session.transport.attempts, 2);
         assert!(printer.is_usable());
         Ok(())
@@ -766,7 +779,7 @@ mod tests {
         transport.reply(1, AE_PAPER);
         let mut printer = Printer::new(transport, Gt01);
         assert_eq!(
-            printer.status().await?.state,
+            printer.status().await?,
             PrinterState::Conditions(vec![PrinterCondition::OutOfPaper])
         );
         assert!(printer.is_usable());
@@ -793,7 +806,7 @@ mod tests {
         transport.reply(1, &common(0xa3, &[0, 0])?);
         transport.reply(2, &common(0xa3, &[])?);
         let mut printer = Printer::new(transport, Gt01);
-        assert_eq!(printer.status().await?.state, PrinterState::Unknown);
+        assert_eq!(printer.status().await?, PrinterState::Unknown);
         assert!(printer.is_usable());
         assert!(matches!(
             printer.status().await,
@@ -930,7 +943,7 @@ mod tests {
         let mut transport = Script::default();
         transport.notify(Duration::ZERO, &[AE_READY, &info[..1]].concat());
         let mut printer = Printer::new(transport, Gt01);
-        assert_eq!(printer.status().await?.state, PrinterState::Ready);
+        assert_eq!(printer.status().await?, PrinterState::Ready);
         printer
             .session
             .transport
@@ -944,13 +957,16 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn mxw01_state_and_start_rejection_have_distinct_errors() -> Result<()> {
-        for (state, error, start_code) in [
-            (1, None, 0),
-            (0, Some(1), 0),
-            (0, Some(4), 0),
-            (0, Some(8), 0),
-            (2, None, 0),
-            (0, None, 1),
+        for (state, error, start_code, condition) in [
+            (1, None, 0, None),
+            (0, Some(0), 0, Some(PrinterCondition::Unknown)),
+            (0, Some(1), 0, Some(PrinterCondition::OutOfPaper)),
+            (0, Some(4), 0, Some(PrinterCondition::Overheated)),
+            (0, Some(8), 0, Some(PrinterCondition::LowBattery)),
+            (0, Some(9), 0, Some(PrinterCondition::OutOfPaper)),
+            (0, Some(0xfe), 0, Some(PrinterCondition::Unknown)),
+            (2, None, 0, None),
+            (0, None, 1, None),
         ] {
             let mut status = vec![0; 14];
             status[6] = state;
@@ -979,10 +995,11 @@ mod tests {
                     result,
                     Err(Error::PrinterUnavailable(PrinterState::Unknown))
                 ));
-            } else {
+            } else if let Some(condition) = condition {
                 assert!(matches!(
                     result,
-                    Err(Error::PrinterUnavailable(PrinterState::Conditions(_)))
+                    Err(Error::PrinterUnavailable(PrinterState::Conditions(actual)))
+                        if actual == vec![condition]
                 ));
             }
             assert!(!printer.is_usable());
@@ -994,6 +1011,43 @@ mod tests {
                     .iter()
                     .all(|(channel, _)| *channel == crate::WriteChannel::Control)
             );
+        }
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn mxw01_status_requires_the_error_byte_only_when_flagged() -> Result<()> {
+        for (payload, expected) in [
+            (vec![0; 12], Err(())),
+            (vec![0; 13], Ok(PrinterState::Ready)),
+            (
+                {
+                    let mut payload = vec![0; 13];
+                    payload[12] = 1;
+                    payload
+                },
+                Err(()),
+            ),
+            (
+                {
+                    let mut payload = vec![0; 14];
+                    payload[12] = 1;
+                    payload
+                },
+                Ok(PrinterState::Conditions(vec![PrinterCondition::Unknown])),
+            ),
+        ] {
+            let mut transport = Script::default();
+            transport.reply(1, &mxw(0xa1, &payload, true)?);
+            let mut printer = Printer::new(transport, crate::Mxw01::default());
+            let result = printer.status().await;
+            if let Ok(state) = expected {
+                assert_eq!(result?, state);
+                assert!(printer.is_usable());
+            } else {
+                assert!(matches!(result, Err(Error::InvalidReply("MXW01 status"))));
+                assert!(!printer.is_usable());
+            }
         }
         Ok(())
     }

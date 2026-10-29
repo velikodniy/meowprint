@@ -351,7 +351,7 @@ mod tests {
                 .collect();
             assert_eq!(raster.len(), 90 * 48);
             assert_eq!(&raster[48..96], &[0x81; 48]);
-            assert_eq!(printer.status().await?.state, PrinterState::Ready);
+            assert_eq!(printer.status().await?, PrinterState::Ready);
             assert_eq!(
                 printer.device_info().await?.firmware_version.as_deref(),
                 Some("v1")
@@ -362,7 +362,7 @@ mod tests {
         let mut source = Pixels::new(PixelFormat::Mono, 1);
         let report = printer.print(&mut source, &Gt01Options::default()).await?;
         assert_eq!(report.completion, Completion::TimedDrain);
-        assert_eq!(printer.status().await?.state, PrinterState::Ready);
+        assert_eq!(printer.status().await?, PrinterState::Ready);
         assert_eq!(
             printer.device_info().await?.description.as_deref(),
             Some("firmware 1")

@@ -4,8 +4,8 @@ use super::{BleProfile, Observation, Operations, Settings};
 use crate::session::{Operation, REPLY_TIMEOUT, ReplyKind};
 use crate::stream::RowReader;
 use crate::{
-    Completion, DeviceInfo, Driver, Error, PixelFormat, PrinterCondition, PrinterState,
-    PrinterStatus, Result, RowSource, Transport, WriteChannel, error::invalid,
+    Completion, DeviceInfo, Driver, Error, PixelFormat, PrinterCondition, PrinterState, Result,
+    RowSource, Transport, WriteChannel, error::invalid,
 };
 use std::time::Duration;
 
@@ -128,8 +128,8 @@ impl Operations for Mxw01 {
         rows.fill(operation, &mut stream.row).await?;
         operation.send_command(&stream.intensity, submitted).await?;
         let status = operation.request_status(&stream.status, submitted).await?;
-        if status.state != PrinterState::Ready {
-            return Err(Error::PrinterUnavailable(status.state));
+        if status != PrinterState::Ready {
+            return Err(Error::PrinterUnavailable(status));
         }
         let start = operation
             .exchange(
@@ -198,7 +198,7 @@ impl Operations for Mxw01 {
             .await?;
         Ok(Completion::PrinterComplete)
     }
-    async fn status<T: Transport>(operation: &mut Operation<'_, T, Self>) -> Result<PrinterStatus> {
+    async fn status<T: Transport>(operation: &mut Operation<'_, T, Self>) -> Result<PrinterState> {
         let command = Command::Query(Query::Status).prepare(MAX_PAYLOAD)?;
         operation.status(&command).await
     }
@@ -229,7 +229,7 @@ impl Operations for Mxw01 {
     }
     fn observe(&self, frame: &Frame) -> Result<Observation> {
         let status = if frame.command == 0xa1 {
-            Some(Status::from_frame(frame)?.snapshot())
+            Some(status(frame)?)
         } else {
             None
         };
@@ -282,9 +282,9 @@ pub enum ReplyFormat {
 
 /// A query encoded by [`Command::Query`] for the MXW01 protocol family.
 ///
-/// Applications use [`Printer::status`](crate::Printer::status) and [`Printer::device_info`](crate::Printer::device_info).
-/// Only [`Self::Status`] has a field parser here, [`Status::from_frame`].
-/// Other reply layouts remain specific to the firmware.
+/// Applications use [`Printer::status`](crate::Printer::status) and
+/// [`Printer::device_info`](crate::Printer::device_info). Reply layouts vary
+/// by firmware.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Query {
     /// Observed status (`A1`).
@@ -348,60 +348,21 @@ impl Command {
     }
 }
 
-/// An owned copy of the known fields in an MXW01 status reply.
-///
-/// Call [`Status::from_frame`] after a [`Query::Status`] request. The original
-/// [`Frame`] retains all bytes, including fields whose meaning remains unknown.
-/// This type does not borrow the frame or update when the printer state changes.
-///
-/// The print session requires both `state` and `flag` to be zero before starting
-/// a job.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct Status {
-    /// Observed state. Zero means standby. Other values prevent a new job.
-    state: u8,
-    /// Overall status flag. Zero means no reported error.
-    flag: u8,
-    /// Error byte when the flag is nonzero.
-    error: Option<u8>,
-}
-impl Status {
-    fn snapshot(self) -> PrinterStatus {
-        let state = match (self.error, self.state) {
-            (None, 0) => PrinterState::Ready,
-            (None, 1) => PrinterState::Printing,
-            (None, _) => PrinterState::Unknown,
-            (Some(error), _) => PrinterState::Conditions(vec![match error {
-                1 | 9 => PrinterCondition::OutOfPaper,
-                4 => PrinterCondition::Overheated,
-                8 => PrinterCondition::LowBattery,
-                _ => PrinterCondition::Unknown,
-            }]),
-        };
-        PrinterStatus {
-            state,
-            battery_percent: None,
-            temperature_celsius: None,
-        }
+fn status(frame: &Frame) -> Result<PrinterState> {
+    let data = &frame.payload;
+    if frame.command != 0xa1 || data.len() < 13 || (data[12] != 0 && data.len() < 14) {
+        return Err(Error::InvalidReply("MXW01 status"));
     }
-
-    /// Copy known status fields from their observed payload offsets.
-    ///
-    /// The frame must have command `A1` and at least 13 payload bytes.
-    /// A nonzero flag requires a fourteenth byte for the error. The method does
-    /// not test the frame family, direction, or checksum. Use a decoder for framing.
-    ///
-    /// # Errors
-    /// Reject another command or a payload without the required offsets.
-    fn from_frame(frame: &Frame) -> Result<Self> {
-        let data = &frame.payload;
-        if frame.command != 0xa1 || data.len() < 13 || (data[12] != 0 && data.len() < 14) {
-            return Err(Error::InvalidReply("MXW01 status"));
-        }
-        Ok(Self {
-            state: data[6],
-            flag: data[12],
-            error: (data[12] != 0).then(|| data[13]),
-        })
-    }
+    let error = (data[12] != 0).then(|| data[13]);
+    Ok(match (error, data[6]) {
+        (None, 0) => PrinterState::Ready,
+        (None, 1) => PrinterState::Printing,
+        (None, _) => PrinterState::Unknown,
+        (Some(error), _) => PrinterState::Conditions(vec![match error {
+            1 | 9 => PrinterCondition::OutOfPaper,
+            4 => PrinterCondition::Overheated,
+            8 => PrinterCondition::LowBattery,
+            _ => PrinterCondition::Unknown,
+        }]),
+    })
 }

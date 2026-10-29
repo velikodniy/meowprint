@@ -4,8 +4,8 @@ use super::{BleProfile, Flow, Movement, Observation, Operations, RasterEncoding,
 use crate::session::{Operation, REPLY_TIMEOUT, ReplyKind};
 use crate::stream::RowReader;
 use crate::{
-    Completion, DeviceInfo, Driver, Error, PixelFormat, PrinterCondition, PrinterState,
-    PrinterStatus, Result, RowSource, Transport, WriteChannel, encoding, error::invalid,
+    Completion, DeviceInfo, Driver, Error, PixelFormat, PrinterCondition, PrinterState, Result,
+    RowSource, Transport, WriteChannel, encoding, error::invalid,
 };
 use flate2::{Compress, Compression};
 use lzokay::compress::Dict;
@@ -312,16 +312,11 @@ async fn submit<T: Transport, D: Driver, S: RowSource>(
         Completion::TimedDrain
     })
 }
-fn status(frame: &Frame) -> Result<PrinterStatus> {
-    let state = match frame.payload.as_slice() {
+fn status(frame: &Frame) -> Result<PrinterState> {
+    Ok(match frame.payload.as_slice() {
         [] => return Err(Error::InvalidReply("printer status")),
         &[flags] => common_state(flags),
         _ => PrinterState::Unknown,
-    };
-    Ok(PrinterStatus {
-        state,
-        battery_percent: None,
-        temperature_celsius: None,
     })
 }
 fn device_info(frame: &Frame) -> Result<DeviceInfo> {
@@ -566,7 +561,7 @@ macro_rules! driver {
             // Common-family framing does not declare a job height; MXW01 requires it.
             fn stream(&self, _height: u32, format: PixelFormat, options: &$options) -> Result<Stream> { ($spec).stream(format, &options.controls()) }
             async fn submit<T: Transport, S: RowSource>(operation: &mut Operation<'_, T, Self>, stream: &mut Stream, rows: &mut RowReader<'_, S>, submitted: &mut usize) -> Result<Completion> { submit(operation, stream, rows, submitted).await }
-            async fn status<T: Transport>(operation: &mut Operation<'_, T, Self>) -> Result<PrinterStatus> {
+            async fn status<T: Transport>(operation: &mut Operation<'_, T, Self>) -> Result<PrinterState> {
                 let command = Command::Query(Query::State).prepare(($spec).max_payload)?;
                 operation.status(&command).await
             }

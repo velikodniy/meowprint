@@ -82,8 +82,8 @@ pub(crate) mod framing;
 mod mxw01;
 
 use crate::{
-    Completion, DeviceInfo, PixelFormat, PrinterState, PrinterStatus, Raster, Result, RowSource,
-    Transport, error::invalid,
+    Completion, DeviceInfo, PixelFormat, PrinterState, Raster, Result, RowSource, Transport,
+    error::invalid,
 };
 use crate::{session::Operation, stream::RowReader};
 use framing::{Decoder, EncodedCommand, Frame};
@@ -196,7 +196,7 @@ pub trait Driver: Operations + Copy + 'static {
 /// Independent effects of one validated frame.
 #[derive(Default)]
 pub(crate) struct Observation {
-    pub status: Option<PrinterStatus>,
+    pub status: Option<PrinterState>,
     pub flow: Option<Flow>,
     pub reply: bool,
 }
@@ -269,7 +269,7 @@ pub(crate) trait Operations: Sized + Send + Sync {
         Self: Driver;
     fn status<T: Transport>(
         operation: &mut Operation<'_, T, Self>,
-    ) -> impl Future<Output = Result<PrinterStatus>> + Send
+    ) -> impl Future<Output = Result<PrinterState>> + Send
     where
         Self: Driver;
     fn device_info<T: Transport>(

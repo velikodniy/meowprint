@@ -45,25 +45,6 @@ pub enum PrinterCondition {
     Unknown,
 }
 
-/// The printer's status at the time of its last report.
-///
-/// Missing or undocumented readings are `None`. A successful request can still
-/// return [`PrinterState::Unknown`] if the library cannot interpret the reply.
-/// See [`Printer::status`](crate::Printer::status) for when a new report is requested.
-#[derive(Debug, Clone, PartialEq)]
-pub struct PrinterStatus {
-    /// Readiness, activity, or reported conditions.
-    pub state: PrinterState,
-    /// Battery level from 0 through 100 percent, or `None` when unavailable.
-    ///
-    /// Current drivers return `None` because the firmware's battery scale is unknown.
-    pub battery_percent: Option<u8>,
-    /// Print head temperature in degrees Celsius, or `None` when unavailable.
-    ///
-    /// Current drivers return `None` because the firmware's temperature units are unknown.
-    pub temperature_celsius: Option<f32>,
-}
-
 impl PrinterState {
     pub(crate) fn blocks_submission(&self) -> bool {
         match self {

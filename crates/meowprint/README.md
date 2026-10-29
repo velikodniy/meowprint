@@ -160,14 +160,14 @@ Meowprint itself does not enable image file formats. The `png` feature above ena
 
 ## Read printer information
 
-`Printer::status()` returns named states and conditions, such as ready, out of paper, or overheated. `Printer::device_info()` returns device text and a firmware version when available. Missing or unknown readings are `None`. An unknown state does not mean that the printer is ready.
+`Printer::status()` returns a `PrinterState` with named states and conditions such as ready, out of paper, or overheated. `Printer::device_info()` returns optional device text and firmware version fields; missing or uninterpretable fields are `None`. An unknown state never implies readiness.
 
 ```no_run
 use meowprint::{Driver, Printer, PrinterState, Transport};
 
 async fn show_status<T: Transport, D: Driver>(printer: &mut Printer<T, D>) -> meowprint::Result<()> {
     let status = printer.status().await?;
-    if status.state == PrinterState::Ready {
+    if status == PrinterState::Ready {
         println!("The printer is ready.");
     }
     let info = printer.device_info().await?;

@@ -1,25 +1,30 @@
 //! Record printer writes in memory with a custom transport and generated row source.
-use async_trait::async_trait;
 use meowprint::{
     Error, Gt01, Gt01Options, PixelFormat, Printer, Result, RowSource, Transport, TransportEvent,
     WriteChannel,
 };
+use std::{future::poll_fn, task::Poll};
 
 #[derive(Default)]
 struct MemoryTransport {
     writes: Vec<(WriteChannel, Vec<u8>)>,
 }
-#[async_trait]
 impl Transport for MemoryTransport {
-    async fn write(&mut self, channel: WriteChannel, bytes: &[u8]) -> Result<()> {
-        self.writes.push((channel, bytes.to_vec()));
-        Ok(())
+    fn write(
+        &mut self,
+        channel: WriteChannel,
+        bytes: &[u8],
+    ) -> impl Future<Output = Result<()>> + Send {
+        poll_fn(move |_| {
+            self.writes.push((channel, bytes.to_vec()));
+            Poll::Ready(Ok(()))
+        })
     }
     async fn event(&mut self) -> Result<TransportEvent> {
         std::future::pending().await
     }
-    async fn disconnect(&mut self) -> Result<()> {
-        Ok(())
+    fn disconnect(&mut self) -> impl Future<Output = Result<()>> + Send {
+        std::future::ready(Ok(()))
     }
 }
 

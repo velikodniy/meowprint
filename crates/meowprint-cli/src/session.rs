@@ -86,13 +86,14 @@ impl<T: Transport, D: Driver, S: Future<Output = io::Result<()>>> Session<T, D, 
 mod tests {
     use super::*;
     use crate::args::Content;
-    use async_trait::async_trait;
     use meowprint::{Error, Gt01, Gt01Options, TransportEvent, WriteChannel};
     use std::{
+        future::poll_fn,
         sync::{
             Arc,
             atomic::{AtomicUsize, Ordering},
         },
+        task::Poll,
         time::Duration,
     };
 
@@ -112,7 +113,6 @@ mod tests {
         write_delay: Duration,
     }
 
-    #[async_trait]
     impl Transport for Script {
         fn max_write_size(&self) -> usize {
             120
@@ -139,12 +139,14 @@ mod tests {
             std::future::pending().await
         }
 
-        async fn disconnect(&mut self) -> meowprint::Result<()> {
-            self.record.disconnects.fetch_add(1, Ordering::SeqCst);
-            if self.fail_disconnect {
-                return Err(Error::Transport("disconnect failed".into()));
-            }
-            Ok(())
+        fn disconnect(&mut self) -> impl Future<Output = meowprint::Result<()>> + Send {
+            poll_fn(move |_| {
+                self.record.disconnects.fetch_add(1, Ordering::SeqCst);
+                if self.fail_disconnect {
+                    return Poll::Ready(Err(Error::Transport("disconnect failed".into())));
+                }
+                Poll::Ready(Ok(()))
+            })
         }
     }
 

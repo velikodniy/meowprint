@@ -14,7 +14,6 @@
 use crate::{
     Driver, Error, Printer, Result, Transport, TransportEvent, WriteChannel, error::invalid,
 };
-use async_trait::async_trait;
 use btleplug::{
     api::{
         Central, CentralEvent, CentralState, CharPropFlags, Characteristic, Manager as _,
@@ -611,7 +610,6 @@ pub struct BleTransport {
     cleanup: Option<CleanupGuard>,
 }
 
-#[async_trait]
 impl Transport for BleTransport {
     fn max_write_size(&self) -> usize {
         write_limit(&self.peripheral)

@@ -546,7 +546,6 @@ mod tests {
         Error, Gt01, PixelFormat, Printer, PrinterCondition, PrinterState, Raster, Result,
         RowSource, Transport, TransportEvent, WriteChannel,
     };
-    use async_trait::async_trait;
     use std::{
         collections::VecDeque,
         future::{Future, poll_fn},
@@ -1697,7 +1696,6 @@ mod tests {
             ));
         }
     }
-    #[async_trait]
     impl Transport for Script {
         fn max_write_size(&self) -> usize {
             self.limit

@@ -15,7 +15,6 @@ use crate::{
     DeviceInfo, Driver, PixelFormat, PrinterStatus, Result,
     session::{OperationKind, Session},
 };
-use async_trait::async_trait;
 use tokio::sync::watch;
 
 /// The logical destination of bytes passed to [`Transport::write`].
@@ -64,13 +63,11 @@ pub enum TransportEvent {
 ///
 /// This in-memory transport records writes and sends no replies. A GT01 print
 /// finishes after its normal wait. Real transports must also report incoming events.
-/// Add `async-trait = "0.1"` to your dependencies to implement this trait.
 #[doc = concat!(
     "\n```no_run\n",
     include_str!("../examples/custom_transport.rs"),
     "\n```\n",
 )]
-#[async_trait]
 pub trait Transport: Send {
     /// Return the maximum byte count that one [`Self::write`] call accepts.
     ///
@@ -86,7 +83,11 @@ pub trait Transport: Send {
     ///
     /// # Errors
     /// Return [`crate::Error::Transport`] on backend failure. Partial submission has an unknown outcome.
-    async fn write(&mut self, channel: WriteChannel, bytes: &[u8]) -> Result<()>;
+    fn write(
+        &mut self,
+        channel: WriteChannel,
+        bytes: &[u8],
+    ) -> impl Future<Output = Result<()>> + Send;
     /// Wait for one event from the selected notification endpoint or link.
     ///
     /// Preserve partial frames and unknown bytes. This method must be safe to
@@ -94,12 +95,12 @@ pub trait Transport: Send {
     ///
     /// # Errors
     /// Return [`crate::Error::Transport`] when the event stream fails.
-    async fn event(&mut self) -> Result<TransportEvent>;
+    fn event(&mut self) -> impl Future<Output = Result<TransportEvent>> + Send;
     /// Close this connection.
     ///
     /// # Errors
     /// Return [`crate::Error::Transport`] if the backend cannot close the link.
-    async fn disconnect(&mut self) -> Result<()>;
+    fn disconnect(&mut self) -> impl Future<Output = Result<()>> + Send;
 }
 
 /// A forward-only source of packed image rows.

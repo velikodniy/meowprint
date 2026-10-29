@@ -107,8 +107,7 @@ mod tests {
         Mxw01, Mxw01Options, Mxw01ReplyFormat, PixelFormat, PrefixedTiny, PrefixedTinyOptions,
         PrinterState, TinyRle, TinyRleOptions, TransportEvent, V5g, WriteChannel, X6h,
     };
-    use async_trait::async_trait;
-    use std::collections::VecDeque;
+    use std::{collections::VecDeque, future::poll_fn, task::Poll};
 
     struct Pixels {
         format: PixelFormat,
@@ -181,40 +180,45 @@ mod tests {
             }
         }
     }
-    #[async_trait]
     impl Transport for Mock {
-        async fn write(&mut self, channel: WriteChannel, bytes: &[u8]) -> Result<()> {
-            self.attempts += 1;
-            if self.fail_write {
-                return Err(Error::Transport("injected failure".into()));
-            }
-            self.writes.push((channel, bytes.to_vec()));
-            if channel == WriteChannel::Control {
-                for (_, frame) in self.decoder.feed_positioned(bytes) {
-                    let mxw01 = self.header == [0x22, 0x21];
-                    let (command, payload) = match (mxw01, frame.command) {
-                        (true, 0xa1) => (0xa1, vec![0; 13]),
-                        (true, 0xa9) => (0xa9, vec![0]),
-                        (true, 0xad) => (0xaa, vec![0]),
-                        (true, 0xb1) => (0xb1, b"v1\0\0".to_vec()),
-                        (false, 0xa3) => (0xa3, vec![0]),
-                        (false, 0xa8) => (0xa8, b"firmware 1".to_vec()),
-                        _ => continue,
-                    };
-                    let mut reply = encode(
-                        self.header,
-                        command,
-                        if mxw01 { 3 } else { 1 },
-                        &payload,
-                        255,
-                    )?;
-                    if !self.crc {
-                        reply.remove(reply.len() - 2);
-                    }
-                    self.replies.push_back(TransportEvent::Notification(reply));
+        fn write(
+            &mut self,
+            channel: WriteChannel,
+            bytes: &[u8],
+        ) -> impl Future<Output = Result<()>> + Send {
+            poll_fn(move |_| {
+                self.attempts += 1;
+                if self.fail_write {
+                    return Poll::Ready(Err(Error::Transport("injected failure".into())));
                 }
-            }
-            Ok(())
+                self.writes.push((channel, bytes.to_vec()));
+                if channel == WriteChannel::Control {
+                    for (_, frame) in self.decoder.feed_positioned(bytes) {
+                        let mxw01 = self.header == [0x22, 0x21];
+                        let (command, payload) = match (mxw01, frame.command) {
+                            (true, 0xa1) => (0xa1, vec![0; 13]),
+                            (true, 0xa9) => (0xa9, vec![0]),
+                            (true, 0xad) => (0xaa, vec![0]),
+                            (true, 0xb1) => (0xb1, b"v1\0\0".to_vec()),
+                            (false, 0xa3) => (0xa3, vec![0]),
+                            (false, 0xa8) => (0xa8, b"firmware 1".to_vec()),
+                            _ => continue,
+                        };
+                        let mut reply = encode(
+                            self.header,
+                            command,
+                            if mxw01 { 3 } else { 1 },
+                            &payload,
+                            255,
+                        )?;
+                        if !self.crc {
+                            reply.remove(reply.len() - 2);
+                        }
+                        self.replies.push_back(TransportEvent::Notification(reply));
+                    }
+                }
+                Poll::Ready(Ok(()))
+            })
         }
         async fn event(&mut self) -> Result<TransportEvent> {
             if let Some(event) = self.replies.pop_front() {
@@ -222,9 +226,11 @@ mod tests {
             }
             std::future::pending().await
         }
-        async fn disconnect(&mut self) -> Result<()> {
-            self.disconnected = true;
-            Ok(())
+        fn disconnect(&mut self) -> impl Future<Output = Result<()>> + Send {
+            poll_fn(move |_| {
+                self.disconnected = true;
+                Poll::Ready(Ok(()))
+            })
         }
     }
 

@@ -37,7 +37,6 @@ name = "load_image"
 required-features = ["image"]
 
 [dependencies]
-async-trait = "0.1"
 btleplug = { version = "0.13.2", optional = true }
 flate2 = "1"
 futures-util = { version = "0.3", optional = true }

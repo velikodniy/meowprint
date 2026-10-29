@@ -1,5 +1,4 @@
 //! Streaming source contracts and independently observed wire boundaries.
-use async_trait::async_trait;
 #[cfg(feature = "image")]
 use meowprint::Raster;
 use meowprint::{
@@ -8,7 +7,7 @@ use meowprint::{
 };
 use std::{
     collections::VecDeque,
-    future::Future,
+    future::{Future, poll_fn},
     sync::{
         Arc, Mutex, MutexGuard,
         atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -68,20 +67,23 @@ impl RowSource for Generated {
     }
 }
 struct CountingTransport(Arc<Counts>);
-#[async_trait]
 impl Transport for CountingTransport {
-    async fn write(&mut self, _: WriteChannel, bytes: &[u8]) -> Result<()> {
-        self.0.io.fetch_add(1, Ordering::SeqCst);
-        self.0.bytes.fetch_add(bytes.len(), Ordering::SeqCst);
-        Ok(())
+    fn write(&mut self, _: WriteChannel, bytes: &[u8]) -> impl Future<Output = Result<()>> + Send {
+        poll_fn(move |_| {
+            self.0.io.fetch_add(1, Ordering::SeqCst);
+            self.0.bytes.fetch_add(bytes.len(), Ordering::SeqCst);
+            Poll::Ready(Ok(()))
+        })
     }
     async fn event(&mut self) -> Result<TransportEvent> {
         self.0.io.fetch_add(1, Ordering::SeqCst);
         std::future::pending().await
     }
-    async fn disconnect(&mut self) -> Result<()> {
-        self.0.io.fetch_add(1, Ordering::SeqCst);
-        Ok(())
+    fn disconnect(&mut self) -> impl Future<Output = Result<()>> + Send {
+        poll_fn(|_| {
+            self.0.io.fetch_add(1, Ordering::SeqCst);
+            Poll::Ready(Ok(()))
+        })
     }
 }
 
@@ -171,46 +173,51 @@ struct CheckingTransport {
     pending: Vec<u8>,
     height: usize,
 }
-#[async_trait]
 impl Transport for CheckingTransport {
     fn max_write_size(&self) -> usize {
         63
     }
-    async fn write(&mut self, channel: WriteChannel, bytes: &[u8]) -> Result<()> {
-        assert_eq!(channel, WriteChannel::Control);
-        if self.counts.rows.load(Ordering::SeqCst) < self.height {
-            self.counts.early_write.store(true, Ordering::SeqCst);
-        }
-        self.counts.bytes.fetch_add(bytes.len(), Ordering::SeqCst);
-        self.pending.extend_from_slice(bytes);
-        while self.pending.len() >= 6 {
-            let length = usize::from(u16::from_le_bytes([self.pending[4], self.pending[5]]));
-            if self.pending.len() < length + 8 {
-                break;
+    fn write(
+        &mut self,
+        channel: WriteChannel,
+        bytes: &[u8],
+    ) -> impl Future<Output = Result<()>> + Send {
+        poll_fn(move |_| {
+            assert_eq!(channel, WriteChannel::Control);
+            if self.counts.rows.load(Ordering::SeqCst) < self.height {
+                self.counts.early_write.store(true, Ordering::SeqCst);
             }
-            assert_eq!(&self.pending[..2], &[0x51, 0x78]);
-            if self.pending[2] == 0xa2 {
-                let row = self.counts.frames.fetch_add(1, Ordering::SeqCst);
-                let payload = &self.pending[6..6 + length];
-                assert_eq!(payload.len(), 48);
-                if row == 0 || row == self.height + 1 {
-                    assert_eq!(payload, &[0; 48]);
-                } else {
-                    for (column, &value) in payload.iter().enumerate() {
-                        assert_eq!(value, pixel(row - 1, column));
+            self.counts.bytes.fetch_add(bytes.len(), Ordering::SeqCst);
+            self.pending.extend_from_slice(bytes);
+            while self.pending.len() >= 6 {
+                let length = usize::from(u16::from_le_bytes([self.pending[4], self.pending[5]]));
+                if self.pending.len() < length + 8 {
+                    break;
+                }
+                assert_eq!(&self.pending[..2], &[0x51, 0x78]);
+                if self.pending[2] == 0xa2 {
+                    let row = self.counts.frames.fetch_add(1, Ordering::SeqCst);
+                    let payload = &self.pending[6..6 + length];
+                    assert_eq!(payload.len(), 48);
+                    if row == 0 || row == self.height + 1 {
+                        assert_eq!(payload, &[0; 48]);
+                    } else {
+                        for (column, &value) in payload.iter().enumerate() {
+                            assert_eq!(value, pixel(row - 1, column));
+                        }
                     }
                 }
+                self.pending.drain(..length + 8);
             }
-            self.pending.drain(..length + 8);
-        }
-        assert!(self.pending.len() < 64);
-        Ok(())
+            assert!(self.pending.len() < 64);
+            Poll::Ready(Ok(()))
+        })
     }
     async fn event(&mut self) -> Result<TransportEvent> {
         std::future::pending().await
     }
-    async fn disconnect(&mut self) -> Result<()> {
-        Ok(())
+    fn disconnect(&mut self) -> impl Future<Output = Result<()>> + Send {
+        std::future::ready(Ok(()))
     }
 }
 #[tokio::test(start_paused = true)]
@@ -274,40 +281,46 @@ struct RecordingTransport {
     pending: Vec<u8>,
     replies: VecDeque<TransportEvent>,
 }
-#[async_trait]
 impl Transport for RecordingTransport {
     fn max_write_size(&self) -> usize {
         self.limit
     }
-    async fn write(&mut self, channel: WriteChannel, bytes: &[u8]) -> Result<()> {
-        assert!(bytes.len() <= self.limit);
-        record(&self.shared)?.writes.push((channel, bytes.to_vec()));
-        if channel == WriteChannel::Control {
-            self.pending.extend_from_slice(bytes);
-            while self.pending.len() >= 6 {
-                let length = usize::from(u16::from_le_bytes([self.pending[4], self.pending[5]]));
-                if self.pending.len() < length + 8 {
-                    break;
-                }
-                let command = self.pending[2];
-                record(&self.shared)?
-                    .controls
-                    .push((command, self.pending[6..6 + length].to_vec()));
-                if self.mxw01 {
-                    let response = match command {
-                        0xa1 => Some(reply(0xa1, &[0; 13])),
-                        0xa9 => Some(reply(0xa9, &[0])),
-                        0xad => Some(reply(0xaa, &[0])),
-                        _ => None,
-                    };
-                    if let Some(bytes) = response {
-                        self.replies.push_back(TransportEvent::Notification(bytes));
+    fn write(
+        &mut self,
+        channel: WriteChannel,
+        bytes: &[u8],
+    ) -> impl Future<Output = Result<()>> + Send {
+        poll_fn(move |_| {
+            assert!(bytes.len() <= self.limit);
+            record(&self.shared)?.writes.push((channel, bytes.to_vec()));
+            if channel == WriteChannel::Control {
+                self.pending.extend_from_slice(bytes);
+                while self.pending.len() >= 6 {
+                    let length =
+                        usize::from(u16::from_le_bytes([self.pending[4], self.pending[5]]));
+                    if self.pending.len() < length + 8 {
+                        break;
                     }
+                    let command = self.pending[2];
+                    record(&self.shared)?
+                        .controls
+                        .push((command, self.pending[6..6 + length].to_vec()));
+                    if self.mxw01 {
+                        let response = match command {
+                            0xa1 => Some(reply(0xa1, &[0; 13])),
+                            0xa9 => Some(reply(0xa9, &[0])),
+                            0xad => Some(reply(0xaa, &[0])),
+                            _ => None,
+                        };
+                        if let Some(bytes) = response {
+                            self.replies.push_back(TransportEvent::Notification(bytes));
+                        }
+                    }
+                    self.pending.drain(..length + 8);
                 }
-                self.pending.drain(..length + 8);
             }
-        }
-        Ok(())
+            Poll::Ready(Ok(()))
+        })
     }
     async fn event(&mut self) -> Result<TransportEvent> {
         if let Some(event) = self.replies.pop_front() {
@@ -315,8 +328,8 @@ impl Transport for RecordingTransport {
         }
         std::future::pending().await
     }
-    async fn disconnect(&mut self) -> Result<()> {
-        Ok(())
+    fn disconnect(&mut self) -> impl Future<Output = Result<()>> + Send {
+        std::future::ready(Ok(()))
     }
 }
 fn recording(limit: usize, mxw01: bool, shared: &Arc<Mutex<Record>>) -> RecordingTransport {

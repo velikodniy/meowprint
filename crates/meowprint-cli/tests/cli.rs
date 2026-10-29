@@ -7,40 +7,37 @@ fn miao() -> Command {
 }
 
 #[test]
-#[expect(
-    clippy::unwrap_used,
-    reason = "A failed fixture or assertion must fail this test."
-)]
-fn previews_work_without_bluetooth_and_save_exact_pixels() {
-    let directory = std::env::temp_dir().join(format!("miao-cli-{}", std::process::id()));
-    std::fs::create_dir_all(&directory).unwrap();
-    let source = directory.join("source.png");
-    image::GrayImage::from_pixel(64, 32, image::Luma([0]))
-        .save(&source)
-        .unwrap();
+fn previews_work_without_bluetooth_and_save_exact_pixels() -> Result<(), Box<dyn std::error::Error>>
+{
+    let directory = tempfile::tempdir()?;
+    let source = directory.path().join("source.png");
+    image::GrayImage::from_pixel(64, 32, image::Luma([0])).save(&source)?;
     for (name, args) in [
-        ("image", vec!["image", source.to_str().unwrap()]),
+        ("image", vec!["image"]),
         ("qr", vec!["qr", "miao-cli-test"]),
     ] {
-        let output = directory.join(format!("{name}.png"));
-        let result = miao()
+        let output = directory.path().join(format!("{name}.png"));
+        let mut command = miao();
+        command
             .args(["preview", "--driver", "gt01", "--output"])
             .arg(&output)
-            .args(args)
-            .output()
-            .unwrap();
+            .args(args);
+        if name == "image" {
+            command.arg(&source);
+        }
+        let result = command.output()?;
         assert!(
             result.status.success(),
             "{}",
             String::from_utf8_lossy(&result.stderr)
         );
-        let preview = image::open(output).unwrap().to_luma8();
+        let preview = image::open(&output)?.to_luma8();
         let reference = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("tests/fixtures")
             .join(format!("{name}.png"));
         assert_eq!(
             preview,
-            image::open(reference).unwrap().to_luma8(),
+            image::open(reference)?.to_luma8(),
             "{name} pixels changed"
         );
         assert_eq!(preview.width(), 384);
@@ -51,23 +48,22 @@ fn previews_work_without_bluetooth_and_save_exact_pixels() {
         if name == "qr" {
             let mut prepared = rqrr::PreparedImage::prepare(preview);
             let grids = prepared.detect_grids();
-            assert_eq!(grids[0].decode().unwrap().1, "miao-cli-test");
+            assert_eq!(grids[0].decode()?.1, "miao-cli-test");
         }
     }
-    std::fs::remove_dir_all(directory).unwrap();
+    Ok(())
 }
 
 #[test]
 fn text_preview_uses_the_embedded_font() -> Result<(), Box<dyn std::error::Error>> {
-    let directory = std::env::temp_dir().join(format!("meowprint-text-{}", std::process::id()));
-    std::fs::create_dir_all(&directory)?;
+    let directory = tempfile::tempdir()?;
     let font = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/fonts/Roboto.ttf");
     let mut previews = Vec::new();
     for name in ["default", "explicit"] {
-        let output = directory.join(format!("{name}.png"));
+        let output = directory.path().join(format!("{name}.png"));
         let mut command = miao();
         command
-            .current_dir(&directory)
+            .current_dir(directory.path())
             .args(["preview", "--driver", "gt01", "--output"])
             .arg(&output)
             .args(["text", "Hello! Привет! Γειά! café € £ 0123456789 Il1 O0"]);
@@ -80,22 +76,20 @@ fn text_preview_uses_the_embedded_font() -> Result<(), Box<dyn std::error::Error
             "{}",
             String::from_utf8_lossy(&result.stderr)
         );
-        let preview = image::open(output)?.to_luma8();
+        let preview = image::open(&output)?.to_luma8();
         assert_eq!(preview.width(), 384);
         assert!(preview.pixels().any(|p| p[0] == 0));
         assert!(preview.pixels().all(|p| p[0] == 0 || p[0] == 255));
         previews.push(preview);
     }
     assert_eq!(previews[0], previews[1]);
-    std::fs::remove_dir_all(directory)?;
     Ok(())
 }
 
 #[test]
 fn missing_font_fails_before_bluetooth_discovery() -> Result<(), Box<dyn std::error::Error>> {
-    let directory = std::env::temp_dir().join(format!("meowprint-font-{}", std::process::id()));
-    std::fs::create_dir_all(&directory)?;
-    let font = directory.join("missing.ttf");
+    let directory = tempfile::tempdir()?;
+    let font = directory.path().join("missing.ttf");
     let result = miao()
         .args(["print", "--device", "not-a-printer", "--driver", "gt01"])
         .args(["text", "Test text", "--font"])
@@ -106,16 +100,13 @@ fn missing_font_fails_before_bluetooth_discovery() -> Result<(), Box<dyn std::er
     assert!(error.contains("Cannot read font"), "{error}");
     assert!(error.contains(&font.display().to_string()), "{error}");
     assert!(!error.contains("Finding printer"), "{error}");
-    std::fs::remove_dir_all(directory)?;
     Ok(())
 }
 #[test]
 fn invalid_print_preview_path_fails_before_bluetooth_discovery()
 -> Result<(), Box<dyn std::error::Error>> {
-    let directory =
-        std::env::temp_dir().join(format!("meowprint-preview-save-{}", std::process::id()));
-    std::fs::create_dir_all(&directory)?;
-    let parent = directory.join("not-a-directory");
+    let directory = tempfile::tempdir()?;
+    let parent = directory.path().join("not-a-directory");
     std::fs::write(&parent, [])?;
     let output = miao()
         .args([
@@ -136,16 +127,14 @@ fn invalid_print_preview_path_fails_before_bluetooth_discovery()
         "{error}"
     );
     assert!(!error.contains("Finding printer"), "{error}");
-    std::fs::remove_dir_all(directory)?;
     Ok(())
 }
 
 #[test]
 fn grayscale_preview_preserves_the_reference_levels() -> Result<(), Box<dyn std::error::Error>> {
-    let directory = std::env::temp_dir().join(format!("meowprint-gray-{}", std::process::id()));
-    std::fs::create_dir_all(&directory)?;
-    let source = directory.join("gray.png");
-    let output = directory.join("preview.png");
+    let directory = tempfile::tempdir()?;
+    let source = directory.path().join("gray.png");
+    let output = directory.path().join("preview.png");
     image::GrayImage::from_fn(384, 2, |x, _| {
         image::Luma([u8::try_from(x % 256).unwrap_or_default()])
     })
@@ -168,12 +157,14 @@ fn grayscale_preview_preserves_the_reference_levels() -> Result<(), Box<dyn std:
         image::open(output)?.to_luma8(),
         image::open(reference)?.to_luma8()
     );
-    std::fs::remove_dir_all(directory)?;
     Ok(())
 }
 #[test]
 fn unsupported_configuration_fails_before_bluetooth_discovery()
 -> Result<(), Box<dyn std::error::Error>> {
+    let directory = tempfile::tempdir()?;
+    let missing = directory.path().join("missing.png");
+    let unused = directory.path().join("unused.png");
     for (flags, expected) in [
         (["--driver", "mxw01", "--feed", "1"], "not supported"),
         (["--driver", "gt01", "--intensity", "1"], "not supported"),
@@ -214,9 +205,9 @@ fn unsupported_configuration_fails_before_bluetooth_discovery()
         if command == "print" {
             cli.args(["--device", "not-a-printer"]);
         } else {
-            cli.args(["--output", "unused.png"]);
+            cli.arg("--output").arg(&unused);
         }
-        let result = cli.args(["image", "missing.png", "--grayscale"]).output()?;
+        let result = cli.arg("image").arg(&missing).arg("--grayscale").output()?;
         assert!(!result.status.success());
         let error = String::from_utf8_lossy(&result.stderr);
         assert!(
@@ -232,11 +223,9 @@ fn unsupported_configuration_fails_before_bluetooth_discovery()
 #[test]
 fn colors_and_transparency_are_converted_before_resizing() -> Result<(), Box<dyn std::error::Error>>
 {
-    let directory =
-        std::env::temp_dir().join(format!("meowprint-transparency-{}", std::process::id()));
-    std::fs::create_dir_all(&directory)?;
-    let color_path = directory.join("color.png");
-    let gray_path = directory.join("gray.png");
+    let directory = tempfile::tempdir()?;
+    let color_path = directory.path().join("color.png");
+    let gray_path = directory.path().join("gray.png");
     let colors = [
         [0, 0, 0, 0],
         [255, 0, 0, 255],
@@ -258,7 +247,7 @@ fn colors_and_transparency_are_converted_before_resizing() -> Result<(), Box<dyn
     ] {
         let mut previews = Vec::new();
         for source in [&color_path, &gray_path] {
-            let output = directory.join("preview.png");
+            let output = directory.path().join("preview.png");
             let result = miao()
                 .args(["preview", "--driver", "x6h", "--output"])
                 .arg(&output)
@@ -275,18 +264,15 @@ fn colors_and_transparency_are_converted_before_resizing() -> Result<(), Box<dyn
         }
         assert_eq!(previews[0], previews[1], "{flags:?}");
     }
-    std::fs::remove_dir_all(directory)?;
     Ok(())
 }
 
 #[test]
 fn oversized_image_is_rejected_before_decoding_and_bluetooth_discovery()
 -> Result<(), Box<dyn std::error::Error>> {
-    let directory =
-        std::env::temp_dir().join(format!("meowprint-image-limit-{}", std::process::id()));
-    std::fs::create_dir_all(&directory)?;
-    let source = directory.join("oversized.bmp");
-    let output = directory.join("preview.png");
+    let directory = tempfile::tempdir()?;
+    let source = directory.path().join("oversized.bmp");
+    let output = directory.path().join("preview.png");
     let mut encoded = std::io::Cursor::new(Vec::new());
     image::DynamicImage::new_rgb8(1, 1).write_to(&mut encoded, image::ImageFormat::Bmp)?;
     let mut bytes = encoded.into_inner();
@@ -310,6 +296,5 @@ fn oversized_image_is_rejected_before_decoding_and_bluetooth_discovery()
         assert!(!error.contains("Finding printer"), "{error}");
         assert!(!output.exists());
     }
-    std::fs::remove_dir_all(directory)?;
     Ok(())
 }

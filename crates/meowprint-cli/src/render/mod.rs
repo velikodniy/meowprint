@@ -1,13 +1,12 @@
 //! Private image, text, and QR rendering.
 mod image;
-mod qr;
+pub mod qr;
 mod text;
 
 use crate::{Result, error::invalid};
 pub use image::Image;
 pub use meowprint::Dither;
 use meowprint::Driver;
-pub use qr::QrCode;
 pub use text::Text;
 
 fn validate_dimensions(driver: impl Driver, height: u32) -> Result<()> {

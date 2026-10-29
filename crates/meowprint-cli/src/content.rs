@@ -1,7 +1,7 @@
 //! Private command-line input and rendered raster content.
 use crate::{
     args::{Content, DitherArg},
-    render::{Image, QrCode, Text},
+    render::{Image, Text, qr},
 };
 use anyhow::{Context, Result};
 use image::{DynamicImage, GrayImage};
@@ -57,7 +57,7 @@ impl Content {
                 image.grayscale = grayscale;
                 image.render(driver)?
             }
-            Self::Qr { content } => QrCode::new(content).render(driver)?,
+            Self::Qr { content } => qr::render(content.as_bytes(), driver)?,
             Self::Text(args) => {
                 let content = match args.file {
                     Some(path) => std::fs::read_to_string(path)?,

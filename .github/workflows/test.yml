@@ -35,7 +35,96 @@ jobs:
         run: cargo test --locked -p meowprint
       - name: Test without default features
         run: cargo test --locked -p meowprint --no-default-features
+      - name: Test Tokio without native Bluetooth
+        run: cargo test --locked -p meowprint --no-default-features --features tokio
       - name: Test workspace with all features
         run: cargo test --locked --workspace --all-features
       - name: Check publication
         run: cargo publish --locked -p meowprint --all-features --dry-run
+
+  portable-targets:
+    name: Portable library (${{ matrix.target }}, ${{ matrix.features }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: riscv32imc-unknown-none-elf
+            features: ""
+            consumer: true
+          - target: riscv32imac-unknown-none-elf
+            features: ""
+            consumer: true
+          - target: wasm32-unknown-unknown
+            features: ""
+          - target: wasm32-unknown-unknown
+            features: std
+          - target: wasm32-unknown-unknown
+            features: image
+          - target: x86_64-unknown-linux-gnu
+            features: std
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Install Rust target
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustup target add ${{ matrix.target }}
+      - name: Check isolated library
+        run: cargo check --locked -p meowprint --lib --no-default-features --target ${{ matrix.target }} --features "${{ matrix.features }}"
+      - name: Check concrete embedded timer consumer
+        if: matrix.consumer
+        env:
+          CARGO_TARGET_DIR: ${{ github.workspace }}/target/portable
+        run: cargo check --locked --manifest-path tests/portable/Cargo.toml --lib --no-default-features --target ${{ matrix.target }}
+
+  portable-host:
+    name: Portable Embassy execution
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target/portable
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Install Rust
+        run: |
+          rustup toolchain install stable --profile minimal --component rustfmt
+          rustup default stable
+      - name: Check consumer formatting
+        run: cargo fmt --manifest-path tests/portable/Cargo.toml --all -- --check
+      - name: Run streamed print without Tokio
+        run: cargo run --locked --manifest-path tests/portable/Cargo.toml --no-default-features --features host --example stream
+
+  portable-browser:
+    name: Portable browser execution (${{ matrix.features }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        features: ["", std]
+    env:
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target/portable
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Install Rust and wasm-pack
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustup target add wasm32-unknown-unknown
+          cargo install wasm-pack --locked
+      - uses: browser-actions/setup-chrome@v2
+        id: chrome
+        with:
+          chrome-version: stable
+          install-dependencies: true
+          install-chromedriver: true
+      - name: Run browser transport contracts
+        run: wasm-pack test --headless --chrome --chromedriver "${{ steps.chrome.outputs.chromedriver-path }}" tests/portable --locked --no-default-features --features "${{ matrix.features }}" --test browser

@@ -16,7 +16,7 @@
 //!
 //! ```toml
 //! [dependencies]
-//! meowprint = "0.1"
+//! meowprint = "0.2"
 //! tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 //! ```
 //!
@@ -80,7 +80,7 @@
 //! Enable the `image` feature to convert an `image::DynamicImage` to Mono or Gray4:
 //!
 //! ```toml
-//! meowprint = { version = "0.1", features = ["image"] }
+//! meowprint = { version = "0.2", features = ["image"] }
 //! image = { version = "0.25", default-features = false, features = ["png"] }
 //! ```
 //!

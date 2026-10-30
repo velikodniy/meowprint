@@ -10,7 +10,7 @@ Add these dependencies to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-meowprint = "0.1"
+meowprint = "0.2"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
 
@@ -114,7 +114,7 @@ From the CLI, run `meowprint drivers` without a printer: `grayscale true` means 
 Enable the optional `image` feature for buffered image conversion and raster previews. Add `image` to load files in your application:
 
 ```toml
-meowprint = { version = "0.1", features = ["image"] }
+meowprint = { version = "0.2", features = ["image"] }
 image = { version = "0.25", default-features = false, features = ["png"] }
 ```
 

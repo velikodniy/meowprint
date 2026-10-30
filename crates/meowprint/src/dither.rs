@@ -1,6 +1,7 @@
 //! Row-oriented grayscale dithering, independent of the optional image feature.
 
 use crate::Result;
+use alloc::{vec, vec::Vec};
 
 /// A method for converting gray pixels to black and white dots.
 ///
@@ -27,7 +28,7 @@ impl Dither {
             method: self,
             width,
             reverse: false,
-            errors: std::array::from_fn(|_| {
+            errors: core::array::from_fn(|_| {
                 if self == Self::Threshold {
                     Vec::new()
                 } else {
@@ -303,6 +304,7 @@ const COEFFICIENTS: [[u16; 3]; 128] = [
 #[cfg(test)]
 mod tests {
     use super::Dither;
+    use alloc::vec::Vec;
 
     const METHODS: [Dither; 4] = [
         Dither::Ostromoukhov,

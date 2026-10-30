@@ -1,6 +1,8 @@
 //! Errors from printer input, encoding, and communication.
 
-/// An error from pixel input, encoding, Bluetooth access, or a printer operation.
+use alloc::string::String;
+
+/// A printer input, encoding, or communication failure.
 ///
 /// Invalid source metadata or controls leave a [`Printer`](crate::Printer) usable.
 /// Source or compression failures after submission begins disable the connection,
@@ -63,7 +65,7 @@ pub enum Error {
 }
 
 /// The result type used by Meowprint, with [`Error`] as its failure type.
-pub type Result<T> = std::result::Result<T, Error>;
+pub type Result<T> = core::result::Result<T, Error>;
 
 /// Build an input error for internal validation.
 pub fn invalid(message: impl Into<String>) -> Error {

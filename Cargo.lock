@@ -82,6 +82,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "atomic-waker"
+version = "1.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1505bd5d3d116872e7271a6d4e16d81d0c8570876c8de68093a09ac269d8aac0"
+
+[[package]]
 name = "autocfg"
 version = "1.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -726,11 +732,13 @@ checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 name = "meowprint"
 version = "0.1.1"
 dependencies = [
+ "atomic-waker",
  "btleplug",
  "flate2",
  "futures-util",
  "image",
  "lzokay",
+ "miniz_oxide 0.9.1",
  "thiserror",
  "tokio",
  "uuid",

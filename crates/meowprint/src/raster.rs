@@ -1,6 +1,11 @@
 //! Packed raster pixels.
 
 #[cfg(feature = "image")]
+use alloc::vec;
+use alloc::vec::Vec;
+use core::future;
+
+#[cfg(feature = "image")]
 use crate::{ImageConversion, Position};
 use crate::{Result, RowSource, error::invalid};
 #[cfg(feature = "image")]
@@ -56,19 +61,19 @@ impl RowSource for RasterRows<'_> {
     fn format(&self) -> PixelFormat {
         self.raster.format()
     }
-    fn read_row(&mut self, output: &mut [u8]) -> impl Future<Output = Result<()>> + Send {
+    fn read_row(&mut self, output: &mut [u8]) -> impl Future<Output = Result<()>> {
         if output.len() != self.raster.row_bytes() {
-            return std::future::ready(Err(invalid(
+            return future::ready(Err(invalid(
                 "The row buffer does not match the raster row size.",
             )));
         }
         if self.cursor == self.raster.bytes.len() {
-            return std::future::ready(Err(invalid("The raster row source is exhausted.")));
+            return future::ready(Err(invalid("The raster row source is exhausted.")));
         }
         let end = self.cursor + output.len();
         output.copy_from_slice(&self.raster.bytes[self.cursor..end]);
         self.cursor = end;
-        std::future::ready(Ok(()))
+        future::ready(Ok(()))
     }
 }
 
@@ -302,6 +307,7 @@ impl Raster {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloc::vec;
 
     #[tokio::test]
     async fn row_cursor_preserves_position_on_errors_and_restarts_explicitly() -> Result<()> {

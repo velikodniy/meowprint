@@ -1,7 +1,8 @@
 //! Streaming printer submissions.
-
 use crate::session::{Operation, OperationKind};
-use crate::{Driver, PixelFormat, PrintReport, Printer, Raster, Result, RowSource, Transport};
+use crate::{
+    Clock, Driver, PixelFormat, PrintReport, Printer, Raster, Result, RowSource, Transport,
+};
 
 /// Reads exactly the declared number of packed rows from a source.
 pub struct RowReader<'a, S> {
@@ -29,9 +30,9 @@ impl<'a, S: RowSource> RowReader<'a, S> {
     }
 
     /// Fill as many whole rows as fit, up to the declared height.
-    pub(crate) async fn fill<T: Transport, D: Driver>(
+    pub(crate) async fn fill<T: Transport, D: Driver, C: Clock>(
         &mut self,
-        operation: &mut Operation<'_, T, D>,
+        operation: &mut Operation<'_, T, D, C>,
         output: &mut [u8],
     ) -> Result<usize> {
         if self.remaining == 0 {
@@ -48,7 +49,7 @@ impl<'a, S: RowSource> RowReader<'a, S> {
     }
 }
 
-impl<T: Transport, D: Driver> Printer<T, D> {
+impl<T: Transport, D: Driver, C: Clock> Printer<T, D, C> {
     /// Stream packed rows to the printer.
     ///
     /// Metadata and options are validated before rows are requested or printer I/O
@@ -85,7 +86,9 @@ impl<T: Transport, D: Driver> Printer<T, D> {
             ));
         }
         let mut stream = self.driver.stream(height, format, options)?;
-        let mut operation = self.session.begin(self.driver, OperationKind::Submit)?;
+        let mut operation = self
+            .session
+            .begin(self.driver, OperationKind::Submit, &self.clock)?;
         let mut rows = RowReader::new(source, height, width, format);
         let mut submitted = 0;
         let result = D::submit(&mut operation, &mut stream, &mut rows, &mut submitted)
@@ -98,7 +101,7 @@ impl<T: Transport, D: Driver> Printer<T, D> {
         operation.finish(result).await
     }
 }
-#[cfg(test)]
+#[cfg(all(test, feature = "tokio"))]
 mod tests {
     use super::*;
     use crate::driver::framing::{Decoder, encode};
@@ -107,7 +110,8 @@ mod tests {
         Mxw01, Mxw01Options, Mxw01ReplyFormat, PixelFormat, PrefixedTiny, PrefixedTinyOptions,
         PrinterState, TinyRle, TinyRleOptions, TransportEvent, V5g, WriteChannel, X6h,
     };
-    use std::{collections::VecDeque, future::poll_fn, task::Poll};
+    use alloc::{collections::VecDeque, vec, vec::Vec};
+    use core::{future::poll_fn, task::Poll};
 
     struct Mock {
         decoder: Decoder,
@@ -177,6 +181,54 @@ mod tests {
                 Poll::Ready(Ok(()))
             })
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn owned_generic_print_runs_on_a_worker() -> Result<()> {
+        struct Rows(u8);
+        impl RowSource for Rows {
+            fn width(&self) -> u32 {
+                384
+            }
+            fn height(&self) -> u32 {
+                8
+            }
+            fn format(&self) -> PixelFormat {
+                PixelFormat::Mono
+            }
+            fn read_row(&mut self, output: &mut [u8]) -> impl Future<Output = Result<()>> {
+                output.fill(self.0);
+                self.0 += 1;
+                core::future::ready(Ok(()))
+            }
+        }
+        fn spawn<T, D, C, S>(
+            mut printer: Printer<T, D, C>,
+            mut source: S,
+        ) -> tokio::task::JoinHandle<Result<PrintReport>>
+        where
+            T: Transport + 'static,
+            D: Driver + 'static,
+            D::Options: 'static,
+            C: Clock + 'static,
+            S: RowSource + 'static,
+        {
+            let caller = std::thread::current().id();
+            tokio::spawn(async move {
+                assert_ne!(std::thread::current().id(), caller);
+                let result = printer.print(&mut source, &D::Options::default()).await;
+                let disconnected = printer.disconnect().await;
+                let report = result?;
+                disconnected?;
+                Ok(report)
+            })
+        }
+        let printer = Printer::new(Mock::new([0x51, 0x78], true), Gt01);
+        let report = spawn(printer, Rows(0))
+            .await
+            .map_err(|error| Error::Transport(error.to_string()))??;
+        assert_eq!(report.image_rows, 8);
+        Ok(())
     }
 
     async fn wire<D: Driver>(
@@ -346,8 +398,8 @@ mod compile_fail_examples {
     /// A live print future exclusively borrows its printer:
     ///
     /// ```compile_fail
-    /// use meowprint::{Gt01, Gt01Options, Printer, RowSource, Transport};
-    /// async fn printer_borrow<T: Transport, S: RowSource>(printer: &mut Printer<T, Gt01>, source: &mut S) -> meowprint::Result<()> {
+    /// use meowprint::{Clock, Gt01, Gt01Options, Printer, RowSource, Transport};
+    /// async fn printer_borrow<T: Transport, S: RowSource, C: Clock>(printer: &mut Printer<T, Gt01, C>, source: &mut S) -> meowprint::Result<()> {
     ///     let options = Gt01Options::default();
     ///     let active = printer.print(source, &options);
     ///     printer.status().await?;
@@ -359,8 +411,8 @@ mod compile_fail_examples {
     /// Its row source is exclusively borrowed too:
     ///
     /// ```compile_fail
-    /// use meowprint::{Gt01, Gt01Options, Printer, RowSource, Transport};
-    /// async fn source_borrow<T: Transport, S: RowSource>(printer: &mut Printer<T, Gt01>, source: &mut S) -> meowprint::Result<()> {
+    /// use meowprint::{Clock, Gt01, Gt01Options, Printer, RowSource, Transport};
+    /// async fn source_borrow<T: Transport, S: RowSource, C: Clock>(printer: &mut Printer<T, Gt01, C>, source: &mut S) -> meowprint::Result<()> {
     ///     let options = Gt01Options::default();
     ///     let active = printer.print(source, &options);
     ///     source.read_row(&mut [0; 48]).await?;
@@ -372,9 +424,30 @@ mod compile_fail_examples {
     /// The selected driver determines the control type:
     ///
     /// ```compile_fail
-    /// use meowprint::{Gt01, Mx10Options, Printer, RowSource, Transport};
-    /// async fn wrong_options<T: Transport, S: RowSource>(printer: &mut Printer<T, Gt01>, source: &mut S) -> meowprint::Result<()> {
+    /// use meowprint::{Clock, Gt01, Mx10Options, Printer, RowSource, Transport};
+    /// async fn wrong_options<T: Transport, S: RowSource, C: Clock>(printer: &mut Printer<T, Gt01, C>, source: &mut S) -> meowprint::Result<()> {
     ///     printer.print(source, &Mx10Options::default()).await?;
+    ///     Ok(())
+    /// }
+    /// ```
+    ///
+    /// The corresponding sequential borrows and matching controls compile:
+    ///
+    /// ```no_run
+    /// use meowprint::{Clock, Gt01, Gt01Options, Printer, RowSource, Transport};
+    /// async fn printer_borrow<T: Transport, S: RowSource, C: Clock>(printer: &mut Printer<T, Gt01, C>, source: &mut S) -> meowprint::Result<()> {
+    ///     let options = Gt01Options::default();
+    ///     printer.print(source, &options).await?;
+    ///     printer.status().await?;
+    ///     Ok(())
+    /// }
+    /// async fn source_borrow<T: Transport, S: RowSource, C: Clock>(printer: &mut Printer<T, Gt01, C>, source: &mut S) -> meowprint::Result<()> {
+    ///     printer.print(source, &Gt01Options::default()).await?;
+    ///     source.read_row(&mut [0; 48]).await?;
+    ///     Ok(())
+    /// }
+    /// async fn matching_options<T: Transport, S: RowSource, C: Clock>(printer: &mut Printer<T, Gt01, C>, source: &mut S) -> meowprint::Result<()> {
+    ///     printer.print(source, &Gt01Options::default()).await?;
     ///     Ok(())
     /// }
     /// ```

@@ -17,8 +17,10 @@ workspace = true
 
 [features]
 default = ["bluetooth"]
-bluetooth = ["dep:btleplug", "dep:futures-util", "dep:uuid"]
-image = ["dep:image"]
+std = ["thiserror/std"]
+tokio = ["std", "dep:tokio"]
+bluetooth = ["tokio", "dep:btleplug", "dep:futures-util", "dep:uuid"]
+image = ["std", "dep:image"]
 
 [[example]]
 name = "bluetooth"
@@ -36,17 +38,29 @@ required-features = ["image"]
 name = "load_image"
 required-features = ["image"]
 
+[[example]]
+name = "custom_transport"
+required-features = ["tokio"]
+
+[[test]]
+name = "jobs"
+required-features = ["tokio"]
+
 [dependencies]
 btleplug = { version = "0.13.2", optional = true }
-flate2 = "1"
+miniz_oxide = { version = "0.9.1", default-features = false, features = ["with-alloc"] }
 futures-util = { version = "0.3", optional = true }
 image = { version = "0.25", default-features = false, optional = true }
-lzokay = { version = "2", default-features = false, features = ["compress", "std"] }
-thiserror = "2"
-tokio = { version = "1", features = ["rt", "macros", "time", "sync"] }
+lzokay = { version = "2", default-features = false, features = ["compress", "alloc"] }
+thiserror = { version = "2", default-features = false }
+tokio = { version = "1", optional = true, default-features = false, features = ["rt", "macros", "time"] }
 uuid = { version = "1", optional = true }
 
+[target.'cfg(target_has_atomic = "ptr")'.dependencies]
+atomic-waker = { version = "1.1.2", default-features = false }
+
 [dev-dependencies]
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 image = { version = "0.25", default-features = false, features = ["png"] }
-tokio = { version = "1", features = ["rt-multi-thread", "test-util"] }
+tokio = { version = "1", default-features = false, features = ["rt-multi-thread", "macros", "time", "sync", "test-util"] }
 lzokay = { version = "2", default-features = false, features = ["decompress"] }

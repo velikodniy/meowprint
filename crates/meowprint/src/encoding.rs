@@ -1,7 +1,7 @@
 //! Compression of packed pixel bytes.
 
 use crate::{Error, Result, error::invalid};
-use flate2::{Compress, FlushCompress, Status};
+use alloc::string::ToString;
 
 /// Encode LSB-first monochrome pixels into color-and-count runs.
 ///
@@ -65,40 +65,49 @@ pub fn lzo_into(
 /// # Errors
 /// Reject input outside 1 through 65535 bytes, insufficient output space, or
 /// a compressor failure.
-#[expect(
-    clippy::cast_possible_truncation,
-    reason = "Codec progress cannot exceed the input and output slices, whose sizes fit usize."
-)]
-pub fn zlib_into(raw: &[u8], output: &mut [u8], compressor: &mut Compress) -> Result<usize> {
+pub fn zlib_into(
+    raw: &[u8],
+    output: &mut [u8],
+    compressor: &mut miniz_oxide::deflate::core::CompressorOxide,
+) -> Result<usize> {
     validate_block(raw)?;
     compressor.reset();
     let mut input_offset = 0;
     let mut output_offset = 0;
     loop {
-        let before_in = compressor.total_in();
-        let before_out = compressor.total_out();
-        let (input, flush) = if input_offset < raw.len() {
-            (&raw[input_offset..], FlushCompress::None)
-        } else {
-            (&[][..], FlushCompress::Finish)
-        };
-        let status = compressor
-            .compress(input, &mut output[output_offset..], flush)
-            .map_err(|error| Error::Compression(error.to_string()))?;
-        input_offset += (compressor.total_in() - before_in) as usize;
-        output_offset += (compressor.total_out() - before_out) as usize;
-        if status == Status::StreamEnd {
-            return Ok(output_offset);
-        }
         if output_offset == output.len() {
             return Err(invalid(
                 "The frame exceeds the selected driver payload limit.",
             ));
         }
-        if before_in == compressor.total_in() && before_out == compressor.total_out() {
-            return Err(Error::Compression(
-                "The zlib compressor made no progress.".into(),
-            ));
+        let flush = if input_offset < raw.len() {
+            miniz_oxide::MZFlush::None
+        } else {
+            miniz_oxide::MZFlush::Finish
+        };
+        let result = miniz_oxide::deflate::stream::deflate(
+            compressor,
+            &raw[input_offset..],
+            &mut output[output_offset..],
+            flush,
+        );
+        input_offset += result.bytes_consumed;
+        output_offset += result.bytes_written;
+        match result.status {
+            Ok(miniz_oxide::MZStatus::StreamEnd) => return Ok(output_offset),
+            Ok(miniz_oxide::MZStatus::Ok) => {
+                if result.bytes_consumed == 0 && result.bytes_written == 0 {
+                    return Err(Error::Compression(
+                        "The zlib compressor made no progress.".into(),
+                    ));
+                }
+            }
+            Err(miniz_oxide::MZError::Buf) if output_offset == output.len() => {
+                return Err(invalid(
+                    "The frame exceeds the selected driver payload limit.",
+                ));
+            }
+            _ => return Err(Error::Compression("deflate compression error".into())),
         }
     }
 }
@@ -115,7 +124,7 @@ fn validate_block(raw: &[u8]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use flate2::Compression;
+    use alloc::{vec, vec::Vec};
     #[test]
     fn rle_runs_split_and_expand_to_the_original_bits() -> Result<()> {
         let mut encoded = [0; 48];
@@ -127,7 +136,7 @@ mod tests {
         let len = rle_into(&input, &mut encoded).ok_or_else(|| invalid("RLE overflow"))?;
         let actual: Vec<_> = encoded[..len]
             .iter()
-            .flat_map(|&run| std::iter::repeat_n(run >> 7, usize::from(run & 127)))
+            .flat_map(|&run| core::iter::repeat_n(run >> 7, usize::from(run & 127)))
             .collect();
         let expected: Vec<_> = input
             .iter()
@@ -151,7 +160,8 @@ mod tests {
 
     #[test]
     fn zlib_exhaustion_and_exact_capacity_preserve_independent_streams() -> Result<()> {
-        let mut compressor = Compress::new(Compression::default(), true);
+        let mut compressor = miniz_oxide::deflate::core::CompressorOxide::default();
+        compressor.set_format_and_level(miniz_oxide::DataFormat::Zlib, 6);
         let mut expected = [0; 255];
         let length = zlib_into(&[0xa5; 48], &mut expected, &mut compressor)?;
         for capacity in [0, 1, length - 1] {
@@ -171,6 +181,7 @@ mod tests {
         }
         Ok(())
     }
+
     #[test]
     fn lzo_output_exhaustion_is_a_frame_limit_error() {
         let mut dictionary = lzokay::compress::Dict::new();

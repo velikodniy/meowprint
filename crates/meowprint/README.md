@@ -53,7 +53,7 @@ Discovery requires a powered Bluetooth adapter. On Android, adapters with an unk
 
 `Printer::print(&mut source, &options).await` reads packed rows from a `RowSource` with fixed width, height, and pixel format. Each successful `read_row` call fills the entire destination buffer. The library requests exactly the declared number of rows. It does not read an extra row to check for end-of-input, validate trailing data, or restart the source. The source or its caller handles document framing and input deadlines. Without a source deadline, a row read can remain pending until cancellation or a printer fault.
 
-While a row read is pending, other Tokio tasks can supply input or request cancellation, including when transport events are continuously available.
+While a row read is pending, the selected clock yields cooperatively so runtime tasks can supply input or request cancellation, including when transport events are continuously available.
 
 For buffered pixels, construct `Raster::new(width, bytes, format)` and pass `&mut raster.rows()` to `print`. The cursor borrows pixels without cloning or consuming them. Each `raster.rows()` call starts at the first row. The print future borrows the printer, source, and controls until it completes; await it before starting another operation.
 
@@ -165,9 +165,9 @@ Meowprint itself does not enable image file formats. The `png` feature above ena
 `Printer::status()` returns a `PrinterState` with named states and conditions such as ready, out of paper, or overheated. `Printer::device_info()` returns optional device text and firmware version fields; missing or uninterpretable fields are `None`. An unknown state never implies readiness.
 
 ```no_run
-use meowprint::{Driver, Printer, PrinterState, Transport};
+use meowprint::{Clock, Driver, Printer, PrinterState, Transport};
 
-async fn show_status<T: Transport, D: Driver>(printer: &mut Printer<T, D>) -> meowprint::Result<()> {
+async fn show_status<T: Transport, D: Driver, C: Clock>(printer: &mut Printer<T, D, C>) -> meowprint::Result<()> {
     let status = printer.status().await?;
     if status == PrinterState::Ready {
         println!("The printer is ready.");
@@ -194,15 +194,24 @@ To stop an active operation, obtain `Printer::cancellation()` before starting pr
 
 ## Custom connections and further reference
 
-Native Bluetooth support uses the default `bluetooth` feature. To supply another connection, implement `Transport` and pass it with a driver to `Printer::new`. Disable default features to exclude native Bluetooth dependencies:
+Native Bluetooth uses the default `bluetooth` feature and `Device::connect(driver)`. Custom connections implement `Transport`, connect and subscribe first, then choose the runtime boundary:
 
-```toml
-meowprint = { version = "0.1", default-features = false }
-```
+| Consumer | Dependency selection | Construction |
+| --- | --- | --- |
+| Native Bluetooth / CLI | defaults or `bluetooth` | `Device::connect` / `Printer::new` |
+| Native custom transport with Tokio | `default-features = false, features = ["tokio"]` | `Printer::new(transport, driver)` |
+| Bare-metal or browser custom runtime | `default-features = false` | `Printer::with_clock(transport, driver, clock)` |
+| Custom runtime with image conversion | `default-features = false, features = ["image"]` | `Printer::with_clock(transport, driver, clock)` |
 
-Meowprint requires `std`, even with `default-features = false`. Disabling default features removes native Bluetooth support; it does not provide `no_std` support.
+With no features, Meowprint supports full `no_std + alloc` streaming printing through custom transports and clocks. Packed rasters, scanline dithering, every driver and codec, errors, and cancellation remain available. There is no `alloc` feature: a heap is always required. Applications provide the allocator, executor, platform timing, and connected transport; Meowprint does not provide an ESP HAL/BLE or Web Bluetooth backend.
 
-Printer communication requires a Tokio runtime; a current-thread runtime is sufficient. See the [custom transport example](examples/custom_transport.rs) for a complete printing and disconnect sequence. Offline raster conversion and preview require `std` but no runtime.
+`std` enables standard-library error integration without choosing a runtime. `tokio` implies `std`; `bluetooth` implies `tokio`; `image` implies `std`, not Tokio. Buffered image conversion and preview remain std-only and need no runtime. The [custom transport example](examples/custom_transport.rs) uses the `tokio` feature and a current-thread runtime.
+
+Implement `Clock` with monotonic elapsed `Duration` values from a fixed origin, cancellation-safe absolute sleeps, and a cooperative `yield_now`. Sleep must register a wakeup without blocking or completing early, and clocks must support the library's 30-second deadline horizon without wrapping. Browser yields must reach a browser task, such as `setTimeout(0)`, rather than only a microtask. Tokio users get `TokioClock` by default.
+
+On browser and bare-metal targets, `Transport`, `RowSource`, and `Clock` can contain local non-`Send` futures, independently of `std` or `image`. Native targets retain `Send` futures and `Send + Sync` clocks. Without pointer atomics (including bare-metal ESP32-C3), cancellation uses an executor-local `Rc` handle, not a cross-thread or interrupt signal. Dropping a cancellation handle does not cancel.
+
+Codec availability does not establish board RAM fit: the LZO dictionary alone occupies about 455 KB. Raw Mono avoids that dictionary. This portability support does not reduce allocations in existing ESP-IDF firmware or remove std, ESP-IDF, or Tokio from applications that still use them. RISC-V target checks cover C3/C2 and the C6/H2 ISA, not Xtensa firmware, radio compatibility, or paper output.
 
 Custom BLE backends can obtain `BleProfile` through `Driver::ble_profile()` without enabling native Bluetooth. Its 16-bit Bluetooth-base UUIDs identify alternative services and control, raster, and notification characteristics. They do not establish compatibility or service priority. Backend setup must find all endpoints within one compatible service, require `WRITE_WITHOUT_RESPONSE` for both write characteristics and `NOTIFY` for notifications, reject multiple compatible services, and subscribe before creating a `Printer`. Control and raster may share a characteristic. For native Bluetooth connections, use `Device::connect(driver)`.
 

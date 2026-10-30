@@ -1,4 +1,5 @@
 //! Private communication state and one operation's exclusive access to it.
+use crate::clock::{Clock, timeout_at};
 use crate::driver::{
     Flow, Movement, Observation,
     framing::{Decoder, EncodedCommand, Frame},
@@ -8,8 +9,12 @@ use crate::{
     TransportEvent, WriteChannel,
 };
 
-use std::time::Duration;
-use tokio::time::{Instant, timeout, timeout_at};
+use alloc::{vec, vec::Vec};
+use core::{
+    future::{Future, poll_fn},
+    task::Poll,
+    time::Duration,
+};
 
 const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 const PAUSE_TIMEOUT: Duration = Duration::from_secs(15);
@@ -28,8 +33,8 @@ pub struct Session<T> {
     pub(crate) transport: T,
     decoder: Decoder,
     state: ConnectionState,
-    paused_since: Option<Instant>,
-    last_resume: Option<Instant>,
+    paused_since: Option<Duration>,
+    last_resume: Option<Duration>,
     last_ready_position: u64,
     expected_reply: Option<Request>,
     cancellation: Cancellation,
@@ -68,12 +73,19 @@ pub enum OperationKind {
     Submit,
     Cancel,
 }
+enum RowWait {
+    Cancelled,
+    PauseExpired,
+    Source(Result<()>),
+    Event(Result<TransportEvent>),
+}
 
 /// Leaves the session disabled unless `finish` explicitly restores it.
 /// No destructor needs to run asynchronous cleanup.
-pub struct Operation<'a, T, D> {
+pub struct Operation<'a, T, D, C: Clock> {
     session: &'a mut Session<T>,
     driver: D,
+    clock: &'a C,
     kind: OperationKind,
     write_attempted: bool,
     status_seen: bool,
@@ -107,36 +119,39 @@ impl<T: Transport> Session<T> {
             Err(Error::UnusableConnection)
         }
     }
-    pub(crate) fn begin<D: Driver>(
-        &mut self,
+    pub(crate) fn begin<'a, D: Driver, C: Clock>(
+        &'a mut self,
         driver: D,
         kind: OperationKind,
-    ) -> Result<Operation<'_, T, D>> {
+        clock: &'a C,
+    ) -> Result<Operation<'a, T, D, C>> {
         self.ensure_usable()?;
         self.state = ConnectionState::Disabled;
         Ok(Operation {
             session: self,
             driver,
+            clock,
             kind,
             write_attempted: false,
             status_seen: false,
             source_failed: false,
         })
     }
-    pub(crate) async fn disconnect(&mut self) -> Result<()> {
+    pub(crate) async fn disconnect<C: Clock>(&mut self, clock: &C) -> Result<()> {
         self.expected_reply = None;
         if self.state == ConnectionState::Closed {
             return Ok(());
         }
         self.state = ConnectionState::Disabled;
-        timeout(WRITE_TIMEOUT, self.transport.disconnect())
+        let deadline = clock.now() + WRITE_TIMEOUT;
+        timeout_at(clock, deadline, self.transport.disconnect())
             .await
-            .map_err(|_| Error::Timeout("disconnect"))??;
+            .map_err(|()| Error::Timeout("disconnect"))??;
         self.state = ConnectionState::Closed;
         Ok(())
     }
 }
-impl<T: Transport, D: Driver> Operation<'_, T, D> {
+impl<T: Transport, D: Driver, C: Clock> Operation<'_, T, D, C> {
     pub(crate) async fn finish<R>(mut self, result: Result<R>) -> Result<R> {
         self.session.expected_reply = None;
         let safe_rejection = !self.write_attempted
@@ -151,7 +166,7 @@ impl<T: Transport, D: Driver> Operation<'_, T, D> {
             if matches!(result, Err(Error::Cancelled)) {
                 let _ = self.cancel().await;
             }
-            let cleanup = self.session.disconnect().await;
+            let cleanup = self.session.disconnect(self.clock).await;
             if result.is_ok() {
                 cleanup?;
             }
@@ -173,12 +188,14 @@ impl<T: Transport, D: Driver> Operation<'_, T, D> {
         let size = self.chunk_size()?;
         for chunk in bytes.chunks(size) {
             self.write_attempted = true;
-            timeout(
-                WRITE_TIMEOUT,
+            let deadline = self.clock.now() + WRITE_TIMEOUT;
+            timeout_at(
+                self.clock,
+                deadline,
                 self.session.transport.write(WriteChannel::Control, chunk),
             )
             .await
-            .map_err(|_| Error::Timeout("cancel write"))??;
+            .map_err(|()| Error::Timeout("cancel write"))??;
         }
         Ok(())
     }
@@ -208,11 +225,13 @@ impl<T: Transport, D: Driver> Operation<'_, T, D> {
             }
             match observation.flow {
                 Some(Flow::Pause) => {
-                    self.session.paused_since.get_or_insert_with(Instant::now);
+                    if self.session.paused_since.is_none() {
+                        self.session.paused_since = Some(self.clock.now());
+                    }
                 }
                 Some(Flow::Resume) => {
                     if self.session.paused_since.take().is_some() {
-                        self.session.last_resume = Some(Instant::now());
+                        self.session.last_resume = Some(self.clock.now());
                     }
                     self.session.last_ready_position = position;
                 }
@@ -243,54 +262,93 @@ impl<T: Transport, D: Driver> Operation<'_, T, D> {
         if self
             .session
             .paused_since
-            .is_some_and(|since| Instant::now() >= since + PAUSE_TIMEOUT)
+            .is_some_and(|since| self.clock.now() >= since + PAUSE_TIMEOUT)
         {
             return Err(Error::Timeout("printer pause"));
         }
-        let source_future = source.read_row(output);
-        tokio::pin!(source_future);
+        let mut source_future = core::pin::pin!(source.read_row(output));
+        let mut events_since_yield = 0usize;
         loop {
             self.cancelled()?;
             let pause_deadline = self.session.paused_since.map(|since| since + PAUSE_TIMEOUT);
-            if pause_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            if pause_deadline.is_some_and(|deadline| self.clock.now() >= deadline) {
                 return Err(Error::Timeout("printer pause"));
             }
-            tokio::select! {
-                biased;
-                () = self.session.cancellation.cancelled() => return Err(Error::Cancelled),
-                () = async {
+            let clock = self.clock;
+            let selected = {
+                let mut cancellation = core::pin::pin!(self.session.cancellation.cancelled());
+                let mut event = core::pin::pin!(self.session.transport.event());
+                let pause_expired = async {
                     if let Some(deadline) = pause_deadline {
-                        tokio::time::sleep_until(deadline).await;
+                        clock.sleep_until(deadline).await;
                     } else {
-                        std::future::pending::<()>().await;
+                        core::future::pending::<()>().await;
                     }
-                }, if pause_deadline.is_some() => return Err(Error::Timeout("printer pause")),
-                result = &mut source_future => {
+                };
+                let mut pause_expired = core::pin::pin!(pause_expired);
+                poll_fn(|cx| {
+                    if cancellation.as_mut().poll(cx).is_ready() {
+                        return Poll::Ready(RowWait::Cancelled);
+                    }
+                    if pause_deadline.is_some_and(|deadline| clock.now() >= deadline) {
+                        return Poll::Ready(RowWait::PauseExpired);
+                    }
+                    if pause_deadline.is_some() && pause_expired.as_mut().poll(cx).is_ready() {
+                        return Poll::Ready(RowWait::PauseExpired);
+                    }
+                    if let Poll::Ready(result) = source_future.as_mut().poll(cx) {
+                        return Poll::Ready(RowWait::Source(result));
+                    }
+                    if let Poll::Ready(result) = event.as_mut().poll(cx) {
+                        return Poll::Ready(RowWait::Event(result));
+                    }
+                    Poll::Pending
+                })
+                .await
+            };
+            match selected {
+                RowWait::Cancelled => return Err(Error::Cancelled),
+                RowWait::PauseExpired => return Err(Error::Timeout("printer pause")),
+                RowWait::Source(result) => {
                     return result.inspect_err(|_| self.source_failed = true);
                 }
-                event = self.session.transport.event() => {
+                RowWait::Event(event) => {
                     self.handle(event?)?;
+                    events_since_yield += 1;
+                    if events_since_yield == 32 {
+                        events_since_yield = 0;
+                        self.clock.yield_now().await;
+                    }
                 }
             }
-            // Custom transports may return ready events without consuming Tokio's budget.
-            // Let tasks producing input or requesting cancellation run as well.
-            tokio::task::consume_budget().await;
         }
     }
-    async fn event_until(&mut self, deadline: Instant) -> Result<Option<TransportEvent>> {
-        tokio::select! {
-            biased;
-            () = self.session.cancellation.cancelled() => Err(Error::Cancelled),
-            result = timeout_at(deadline, self.session.transport.event()) => result.map_or(Ok(None), |event| event.map(Some))
+    async fn event_until(&mut self, deadline: Duration) -> Result<Option<TransportEvent>> {
+        let clock = self.clock;
+        {
+            let mut cancellation = core::pin::pin!(self.session.cancellation.cancelled());
+            let mut event =
+                core::pin::pin!(timeout_at(clock, deadline, self.session.transport.event()));
+            poll_fn(|cx| {
+                if cancellation.as_mut().poll(cx).is_ready() {
+                    return Poll::Ready(Err(Error::Cancelled));
+                }
+                match event.as_mut().poll(cx) {
+                    Poll::Ready(Ok(event)) => Poll::Ready(event.map(Some)),
+                    Poll::Ready(Err(())) => Poll::Ready(Ok(None)),
+                    Poll::Pending => Poll::Pending,
+                }
+            })
+            .await
         }
     }
-    async fn listen_until(&mut self, deadline: Instant) -> Result<()> {
+    async fn listen_until(&mut self, deadline: Duration) -> Result<()> {
         loop {
             match self.event_until(deadline).await? {
                 Some(event) => self.handle(event)?,
                 None => return Ok(()),
             }
-            if Instant::now() >= deadline {
+            if self.clock.now() >= deadline {
                 return Ok(());
             }
         }
@@ -298,10 +356,29 @@ impl<T: Transport, D: Driver> Operation<'_, T, D> {
     async fn drain_pending(&mut self) -> Result<()> {
         for _ in 0..256 {
             self.cancelled()?;
-            match timeout_at(Instant::now(), self.session.transport.event()).await {
-                Ok(event) => self.handle(event?)?,
-                Err(_) => return Ok(()),
+            if self.kind != OperationKind::Observe
+                && self
+                    .session
+                    .paused_since
+                    .is_some_and(|since| self.clock.now() >= since + PAUSE_TIMEOUT)
+            {
+                return Err(Error::Timeout("printer pause"));
             }
+            let clock = self.clock;
+            let deadline = clock.now();
+            let event = match timeout_at(clock, deadline, self.session.transport.event()).await {
+                Ok(event) => event?,
+                Err(()) => return Ok(()),
+            };
+            if self.kind != OperationKind::Observe
+                && self
+                    .session
+                    .paused_since
+                    .is_some_and(|since| self.clock.now() >= since + PAUSE_TIMEOUT)
+            {
+                return Err(Error::Timeout("printer pause"));
+            }
+            self.handle(event)?;
         }
         Err(Error::Protocol(
             "The printer flooded the connection with notifications.",
@@ -309,6 +386,14 @@ impl<T: Transport, D: Driver> Operation<'_, T, D> {
     }
     pub(crate) async fn wait_ready(&mut self) -> Result<()> {
         loop {
+            if self.kind != OperationKind::Observe
+                && self
+                    .session
+                    .paused_since
+                    .is_some_and(|since| self.clock.now() >= since + PAUSE_TIMEOUT)
+            {
+                return Err(Error::Timeout("printer pause"));
+            }
             self.drain_pending().await?;
             let Some(since) = self.session.paused_since else {
                 return Ok(());
@@ -317,14 +402,17 @@ impl<T: Transport, D: Driver> Operation<'_, T, D> {
                 return Err(Error::PrinterUnavailable(self.paused_status()));
             }
             let deadline = since + PAUSE_TIMEOUT;
+            if self.clock.now() >= deadline {
+                return Err(Error::Timeout("printer pause"));
+            }
             let event = self
                 .event_until(deadline)
                 .await?
                 .ok_or(Error::Timeout("printer pause"))?;
-            self.handle(event)?;
-            if self.session.paused_since.is_some() && Instant::now() >= deadline {
+            if self.clock.now() >= deadline {
                 return Err(Error::Timeout("printer pause"));
             }
+            self.handle(event)?;
         }
     }
     pub(crate) fn chunk_size(&self) -> Result<usize> {
@@ -401,26 +489,33 @@ impl<T: Transport, D: Driver> Operation<'_, T, D> {
                 });
             }
             self.write_attempted = true;
-            timeout(WRITE_TIMEOUT, self.session.transport.write(channel, chunk))
-                .await
-                .map_err(|_| Error::Timeout("transport write"))??;
+            let deadline = self.clock.now() + WRITE_TIMEOUT;
+            timeout_at(
+                self.clock,
+                deadline,
+                self.session.transport.write(channel, chunk),
+            )
+            .await
+            .map_err(|()| Error::Timeout("transport write"))??;
             *submitted += chunk.len();
             if self.driver.settings().finish_control_frame
                 && channel == WriteChannel::Control
                 && index + 1 < count
             {
                 // Finish this control frame before observing cooperative cancellation.
-                let deadline = Instant::now() + self.driver.settings().pacing(size);
-                while let Ok(event) = timeout_at(deadline, self.session.transport.event()).await {
+                let deadline = self.clock.now() + self.driver.settings().pacing(size);
+                while let Ok(event) =
+                    timeout_at(self.clock, deadline, self.session.transport.event()).await
+                {
                     self.handle(event?)?;
-                    if Instant::now() >= deadline {
+                    if self.clock.now() >= deadline {
                         break;
                     }
                 }
                 continue;
             }
             self.cancelled()?;
-            self.listen_until(Instant::now() + self.driver.settings().pacing(size))
+            self.listen_until(self.clock.now() + self.driver.settings().pacing(size))
                 .await?;
         }
         Ok(marker)
@@ -435,7 +530,7 @@ impl<T: Transport, D: Driver> Operation<'_, T, D> {
         self.wait_ready().await?;
         self.session.expected_reply = Some(Request::Armed(kind));
         self.send_command(command, submitted).await?;
-        let deadline = Instant::now() + duration;
+        let deadline = self.clock.now() + duration;
         loop {
             self.cancelled()?;
             if let Some(Request::Waiting { reply, .. }) = &mut self.session.expected_reply
@@ -449,7 +544,7 @@ impl<T: Transport, D: Driver> Operation<'_, T, D> {
                 .await?
                 .ok_or(Error::Timeout("printer reply"))?;
             self.handle(event)?;
-            if Instant::now() >= deadline {
+            if self.clock.now() >= deadline {
                 return Err(Error::Timeout("printer reply"));
             }
         }
@@ -488,20 +583,23 @@ impl<T: Transport, D: Driver> Operation<'_, T, D> {
         self.session.last_ready_position > marker
     }
     async fn drain(&mut self) -> Result<()> {
-        let start = Instant::now();
+        let start = self.clock.now();
         loop {
             let deadline = self.session.last_resume.unwrap_or(start).max(start) + DRAIN_TIME;
             self.listen_until(deadline).await?;
             self.wait_ready().await?;
-            if Instant::now() >= self.session.last_resume.unwrap_or(start).max(start) + DRAIN_TIME {
+            if self.clock.now() >= self.session.last_resume.unwrap_or(start).max(start) + DRAIN_TIME
+            {
                 return Ok(());
             }
         }
     }
     pub(crate) async fn bounded_drain(&mut self) -> Result<()> {
-        timeout(COMPLETION_TIMEOUT, self.drain())
+        let clock = self.clock;
+        let deadline = clock.now() + COMPLETION_TIMEOUT;
+        timeout_at(clock, deadline, self.drain())
             .await
-            .map_err(|_| Error::Timeout("completion wait"))?
+            .map_err(|()| Error::Timeout("completion wait"))?
     }
     pub(crate) async fn send_movement(
         &mut self,
@@ -533,27 +631,83 @@ impl<T: Transport, D: Driver> Operation<'_, T, D> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "tokio"))]
 mod tests {
     //! Failure-oriented tests through the public printer operations.
+    use crate::driver::Operations;
     use crate::{
-        Error, Gt01, PixelFormat, Printer, PrinterCondition, PrinterState, Raster, Result,
+        Clock, Error, Gt01, PixelFormat, Printer, PrinterCondition, PrinterState, Raster, Result,
         RowSource, Transport, TransportEvent, WriteChannel,
     };
+    use alloc::{sync::Arc, vec, vec::Vec};
     use std::{
         collections::VecDeque,
         future::{Future, poll_fn},
         sync::{
-            Arc,
+            Mutex,
             atomic::{AtomicUsize, Ordering},
         },
-        task::Poll,
+        task::{Poll, Waker},
         time::Duration,
     };
 
     const A3_PAPER: &[u8] = &[0x51, 0x78, 0xa3, 1, 1, 0, 1, 7, 0xff];
     const AE_PAPER: &[u8] = &[0x51, 0x78, 0xae, 1, 1, 0, 1, 7, 0xff];
     const AE_PAUSE: &[u8] = &[0x51, 0x78, 0xae, 1, 1, 0, 0x10, 0x70, 0xff];
+
+    #[derive(Clone, Default)]
+    struct ManualClock {
+        state: Arc<Mutex<ManualClockState>>,
+    }
+    #[derive(Default)]
+    struct ManualClockState {
+        now: Duration,
+        waker: Option<Waker>,
+    }
+    impl ManualClock {
+        fn advance(&self, duration: Duration) {
+            let waker = {
+                let mut state = self
+                    .state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                state.now += duration;
+                state.waker.take()
+            };
+            if let Some(waker) = waker {
+                waker.wake();
+            }
+        }
+    }
+    impl Clock for ManualClock {
+        fn now(&self) -> Duration {
+            self.state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .now
+        }
+        fn sleep_until(&self, deadline: Duration) -> impl Future<Output = ()> + Send {
+            let state = Arc::clone(&self.state);
+            async move {
+                poll_fn(move |cx| {
+                    let mut state = state
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    if state.now >= deadline {
+                        state.waker = None;
+                        Poll::Ready(())
+                    } else {
+                        state.waker = Some(cx.waker().clone());
+                        Poll::Pending
+                    }
+                })
+                .await;
+            }
+        }
+        fn yield_now(&self) -> impl Future<Output = ()> + Send {
+            core::future::ready(())
+        }
+    }
 
     #[tokio::test(start_paused = true)]
     async fn status_returns_queued_conditions_without_io() -> Result<()> {
@@ -1065,6 +1219,163 @@ mod tests {
         let mut future = future;
         std::future::poll_fn(|cx| std::task::Poll::Ready(future.as_mut().poll(cx))).await
     }
+
+    #[tokio::test]
+    async fn injected_clock_times_out_one_pending_write_and_cleans_up() -> Result<()> {
+        use crate::session::{OperationKind, Session};
+
+        let clock = ManualClock::default();
+        let mut session = Session::new(
+            Script {
+                block_at: Some(1),
+                immediate_events: true,
+                ..Script::default()
+            },
+            Gt01.decoder(),
+        );
+        let mut operation = session.begin(Gt01, OperationKind::Submit, &clock)?;
+        let mut submitted = 0;
+        let mut send = Box::pin(operation.send(WriteChannel::Control, &[0x01], &mut submitted));
+        assert!(poll_once(send.as_mut()).await.is_pending());
+        clock.advance(Duration::from_secs(5));
+        let result = send.await;
+        assert!(matches!(result, Err(Error::Timeout("transport write"))));
+        let result = operation.finish(result).await;
+        assert!(matches!(result, Err(Error::Timeout("transport write"))));
+        assert_eq!(session.transport.attempts, 1);
+        assert_eq!(session.transport.disconnects, 1);
+        assert!(!session.is_usable());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn expired_event_deadlines_poll_ready_work_without_advancing_clock() -> Result<()> {
+        use crate::session::{OperationKind, Session};
+
+        let clock = ManualClock::default();
+        clock.advance(Duration::from_secs(7));
+        let mut session = Session::new(
+            Script {
+                immediate_events: true,
+                ..Script::default()
+            },
+            Gt01.decoder(),
+        );
+        let mut operation = session.begin(Gt01, OperationKind::Submit, &clock)?;
+        let deadline = clock.now();
+        operation.session.transport.events.push_back((
+            tokio::time::Instant::now(),
+            TransportEvent::Notification(AE_READY.to_vec()),
+        ));
+        assert!(operation.event_until(deadline).await?.is_some());
+        let now = clock.now();
+        assert!(operation.event_until(deadline).await?.is_none());
+        assert_eq!(clock.now(), now);
+        operation.finish(Ok(())).await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn repeated_pause_keeps_its_origin_until_manual_deadline() -> Result<()> {
+        use crate::session::{OperationKind, Session};
+
+        let clock = ManualClock::default();
+        let mut session = Session::new(
+            Script {
+                immediate_events: true,
+                ..Script::default()
+            },
+            Gt01.decoder(),
+        );
+        let mut operation = session.begin(Gt01, OperationKind::Submit, &clock)?;
+        operation.handle(TransportEvent::Notification(AE_PAUSE.to_vec()))?;
+        clock.advance(Duration::from_secs(14));
+        operation.handle(TransportEvent::Notification(AE_PAUSE.to_vec()))?;
+        assert_eq!(operation.session.paused_since, Some(Duration::ZERO));
+
+        let mut waiting = Box::pin(operation.wait_ready());
+        assert!(poll_once(waiting.as_mut()).await.is_pending());
+        clock.advance(Duration::from_secs(1));
+        let result = waiting.await;
+        assert!(matches!(result, Err(Error::Timeout("printer pause"))));
+        let result = operation.finish(result).await;
+        assert!(matches!(result, Err(Error::Timeout("printer pause"))));
+        assert_eq!(clock.now(), Duration::from_secs(15));
+        assert_eq!(session.transport.disconnects, 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn simultaneous_row_readiness_obeys_cancellation_pause_source_event_order() -> Result<()>
+    {
+        use crate::session::{OperationKind, Session};
+
+        let clock = ManualClock::default();
+        let mut session = Session::new(
+            Script {
+                immediate_events: true,
+                ..Script::default()
+            },
+            Gt01.decoder(),
+        );
+        let mut operation = session.begin(Gt01, OperationKind::Submit, &clock)?;
+        operation.session.paused_since = Some(Duration::ZERO);
+        operation.session.transport.events.push_back((
+            tokio::time::Instant::now(),
+            TransportEvent::Notification(AE_READY.to_vec()),
+        ));
+        operation.session.cancellation.cancel();
+        clock.advance(super::PAUSE_TIMEOUT);
+        let mut source = TestRows::new(1, ReadAction::Fill);
+        let result = operation.read_row(&mut source, &mut [0; 48]).await;
+        assert!(matches!(result, Err(Error::Cancelled)));
+        assert_eq!(source.reads, 0);
+        assert_eq!(operation.session.transport.events.len(), 1);
+
+        let clock = ManualClock::default();
+        let mut session = Session::new(
+            Script {
+                immediate_events: true,
+                ..Script::default()
+            },
+            Gt01.decoder(),
+        );
+        let mut operation = session.begin(Gt01, OperationKind::Submit, &clock)?;
+        operation.session.paused_since = Some(Duration::ZERO);
+        operation.session.transport.events.push_back((
+            tokio::time::Instant::now(),
+            TransportEvent::Notification(AE_READY.to_vec()),
+        ));
+        clock.advance(super::PAUSE_TIMEOUT);
+        let mut source = TestRows::new(1, ReadAction::Fill);
+        let result = operation.read_row(&mut source, &mut [0; 48]).await;
+        assert!(matches!(result, Err(Error::Timeout("printer pause"))));
+        assert_eq!(source.reads, 0);
+        assert_eq!(operation.session.transport.events.len(), 1);
+
+        let clock = ManualClock::default();
+        let mut session = Session::new(
+            Script {
+                immediate_events: true,
+                ..Script::default()
+            },
+            Gt01.decoder(),
+        );
+        let mut operation = session.begin(Gt01, OperationKind::Submit, &clock)?;
+        operation.session.transport.events.push_back((
+            tokio::time::Instant::now(),
+            TransportEvent::Notification(AE_READY.to_vec()),
+        ));
+        let mut source = TestRows::new(1, ReadAction::Fill);
+        let mut row = [0; 48];
+        let result = operation.read_row(&mut source, &mut row).await;
+        assert!(result.is_ok());
+        assert_eq!(source.reads, 1);
+        assert_eq!(row, [0xff; 48]);
+        assert_eq!(operation.session.transport.events.len(), 1);
+        operation.finish(result).await?;
+        Ok(())
+    }
     #[tokio::test(start_paused = true)]
     async fn dropping_polled_operations_disables_until_explicit_cleanup() -> Result<()> {
         let mut printer = Printer::new(
@@ -1200,7 +1511,10 @@ mod tests {
             print(&mut printer).await,
             Err(Error::Transport(_))
         ));
-        let mut transport = Script::default();
+        let mut transport = Script {
+            immediate_events: true,
+            ..Script::default()
+        };
         for _ in 0..256 {
             transport.notify(Duration::ZERO, AE_READY);
         }
@@ -1281,13 +1595,14 @@ mod tests {
             command: 0xa3,
             bytes: crate::driver::framing::encode([0x51, 0x78], 0xa3, 0, &[0], 255)?,
         };
-        let mut operation = session.begin(driver, OperationKind::Submit)?;
+        let clock = crate::TokioClock::default();
+        let mut operation = session.begin(driver, OperationKind::Submit, &clock)?;
         let result = operation.send_command(&command, &mut 0).await;
         assert!(matches!(
             operation.finish(result).await,
             Err(Error::PrinterUnavailable(_))
         ));
-        let mut operation = session.begin(driver, OperationKind::Submit)?;
+        let mut operation = session.begin(driver, OperationKind::Submit, &clock)?;
         let result = operation.send_command(&command, &mut 0).await;
         operation.finish(result).await?;
         assert_eq!(session.transport.writes[0].1[0], 0x12);
@@ -1396,7 +1711,10 @@ mod tests {
         }
         let mut printer = Printer::new(transport, Gt01);
         let mut source = TestRows::new(1, ReadAction::AfterPolls(32));
-        let mut operation = printer.session.begin(Gt01, super::OperationKind::Submit)?;
+        let clock = crate::TokioClock::default();
+        let mut operation = printer
+            .session
+            .begin(Gt01, super::OperationKind::Submit, &clock)?;
         let mut row = [0; 48];
         let result = operation.read_row(&mut source, &mut row).await;
         operation.finish(result).await?;
@@ -1412,7 +1730,10 @@ mod tests {
         let mut printer = Printer::new(ready_notification_burst(), Gt01);
         let cancellation = printer.cancellation();
         let mut source = TestRows::new(1, ReadAction::Pending);
-        let mut operation = printer.session.begin(Gt01, super::OperationKind::Submit)?;
+        let clock = crate::TokioClock::default();
+        let mut operation = printer
+            .session
+            .begin(Gt01, super::OperationKind::Submit, &clock)?;
         let stop = tokio::spawn(async move { cancellation.cancel() });
         let result = operation.read_row(&mut source, &mut [0; 48]).await;
         let result = operation.finish(result).await;
@@ -1431,7 +1752,10 @@ mod tests {
         let signal = Arc::new(tokio::sync::Notify::new());
         let mut source = TestRows::new(1, ReadAction::Signal(Arc::clone(&signal)));
         let mut printer = Printer::new(ready_notification_burst(), Gt01);
-        let mut operation = printer.session.begin(Gt01, super::OperationKind::Submit)?;
+        let clock = crate::TokioClock::default();
+        let mut operation = printer
+            .session
+            .begin(Gt01, super::OperationKind::Submit, &clock)?;
         let producer = tokio::spawn(async move { signal.notify_one() });
         let mut row = [0; 48];
         let result = operation.read_row(&mut source, &mut row).await;

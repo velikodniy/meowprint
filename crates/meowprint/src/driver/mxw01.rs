@@ -4,10 +4,11 @@ use super::{BleProfile, Observation, Operations, Settings};
 use crate::session::{Operation, REPLY_TIMEOUT, ReplyKind};
 use crate::stream::RowReader;
 use crate::{
-    Completion, DeviceInfo, Driver, Error, PixelFormat, PrinterCondition, PrinterState, Result,
-    RowSource, Transport, WriteChannel, error::invalid,
+    Clock, Completion, DeviceInfo, Driver, Error, PixelFormat, PrinterCondition, PrinterState,
+    Result, RowSource, Transport, WriteChannel, error::invalid,
 };
-use std::time::Duration;
+use alloc::vec;
+use core::time::Duration;
 
 /// The MXW01 driver for monochrome printing.
 ///
@@ -21,9 +22,9 @@ use std::time::Duration;
 /// additional blank rows.
 ///
 /// ```
-/// use meowprint::{Printer, Transport, Mxw01, Mxw01ReplyFormat};
-/// fn connect_transport<T: Transport>(transport: T) -> Printer<T, Mxw01> {
-///     Printer::new(transport, Mxw01 { reply_format: Mxw01ReplyFormat::WithoutCrc })
+/// use meowprint::{Clock, Printer, Transport, Mxw01, Mxw01ReplyFormat};
+/// fn connect_transport<T: Transport, C: Clock>(transport: T, clock: C) -> Printer<T, Mxw01, C> {
+///     Printer::with_clock(transport, Mxw01 { reply_format: Mxw01ReplyFormat::WithoutCrc }, clock)
 /// }
 /// ```
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -118,8 +119,8 @@ impl Operations for Mxw01 {
             chunk: [0; MAX_CHUNK_SIZE],
         })
     }
-    async fn submit<T: Transport, S: RowSource>(
-        operation: &mut Operation<'_, T, Self>,
+    async fn submit<T: Transport, S: RowSource, C: Clock>(
+        operation: &mut Operation<'_, T, Self, C>,
         stream: &mut Stream,
         rows: &mut RowReader<'_, S>,
         submitted: &mut usize,
@@ -198,12 +199,14 @@ impl Operations for Mxw01 {
             .await?;
         Ok(Completion::PrinterComplete)
     }
-    async fn status<T: Transport>(operation: &mut Operation<'_, T, Self>) -> Result<PrinterState> {
+    async fn status<T: Transport, C: Clock>(
+        operation: &mut Operation<'_, T, Self, C>,
+    ) -> Result<PrinterState> {
         let command = Command::Query(Query::Status).prepare(MAX_PAYLOAD)?;
         operation.status(&command).await
     }
-    async fn device_info<T: Transport>(
-        operation: &mut Operation<'_, T, Self>,
+    async fn device_info<T: Transport, C: Clock>(
+        operation: &mut Operation<'_, T, Self, C>,
     ) -> Result<DeviceInfo> {
         let command = Command::Query(Query::Version).prepare(MAX_PAYLOAD)?;
         let frame = operation
@@ -243,8 +246,8 @@ impl Operations for Mxw01 {
         Command::Cancel.prepare(MAX_PAYLOAD).map(Some)
     }
 }
-async fn append_chunk<T: Transport>(
-    operation: &mut Operation<'_, T, Mxw01>,
+async fn append_chunk<T: Transport, C: Clock>(
+    operation: &mut Operation<'_, T, Mxw01, C>,
     chunk: &mut [u8],
     used: &mut usize,
     bytes: &[u8; 48],

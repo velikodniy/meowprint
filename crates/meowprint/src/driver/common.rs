@@ -4,12 +4,13 @@ use super::{BleProfile, Flow, Movement, Observation, Operations, RasterEncoding,
 use crate::session::{Operation, REPLY_TIMEOUT, ReplyKind};
 use crate::stream::RowReader;
 use crate::{
-    Completion, DeviceInfo, Driver, Error, PixelFormat, PrinterCondition, PrinterState, Result,
-    RowSource, Transport, WriteChannel, encoding, error::invalid,
+    Clock, Completion, DeviceInfo, Driver, Error, PixelFormat, PrinterCondition, PrinterState,
+    Result, RowSource, Transport, WriteChannel, encoding, error::invalid,
 };
-use flate2::{Compress, Compression};
+use alloc::{boxed::Box, format, vec, vec::Vec};
+use core::time::Duration;
 use lzokay::compress::Dict;
-use std::time::Duration;
+use miniz_oxide::deflate::core::CompressorOxide;
 
 /// Monochrome compression choices for [`Gt01`], [`TinyRle`], and [`PrefixedTiny`].
 ///
@@ -246,7 +247,7 @@ impl Spec {
         if self.lattice {
             end.push(Command::LatticeEnd);
         }
-        end.extend(std::iter::repeat_n(
+        end.extend(core::iter::repeat_n(
             Command::Query(Query::State),
             self.end_queries,
         ));
@@ -271,8 +272,8 @@ pub struct Stream {
     blank: Vec<u8>,
     encoder: RowEncoder,
 }
-async fn submit<T: Transport, D: Driver, S: RowSource>(
-    operation: &mut Operation<'_, T, D>,
+async fn submit<T: Transport, D: Driver, S: RowSource, C: Clock>(
+    operation: &mut Operation<'_, T, D, C>,
     stream: &mut Stream,
     rows: &mut RowReader<'_, S>,
     submitted: &mut usize,
@@ -373,7 +374,7 @@ enum Codec {
     Raw,
     Rle,
     Lzo(Box<Dict>),
-    Zlib(Compress),
+    Zlib(Box<CompressorOxide>),
 }
 
 struct RowEncoder {
@@ -412,7 +413,9 @@ impl RowEncoder {
             RasterEncoding::Rle => Codec::Rle,
             RasterEncoding::Lzo | RasterEncoding::LzoBands => Codec::Lzo(Dict::new()),
             RasterEncoding::ZlibExperimental => {
-                Codec::Zlib(Compress::new(Compression::default(), true))
+                let mut compressor = Box::<CompressorOxide>::default();
+                compressor.set_format_and_level(miniz_oxide::DataFormat::Zlib, 6);
+                Codec::Zlib(compressor)
             }
         };
         Ok(Self {
@@ -560,12 +563,12 @@ macro_rules! driver {
             fn decoder(&self) -> Decoder { Decoder::new(HEADER, ($spec).max_payload, true) }
             // Common-family framing does not declare a job height; MXW01 requires it.
             fn stream(&self, _height: u32, format: PixelFormat, options: &$options) -> Result<Stream> { ($spec).stream(format, &options.controls()) }
-            async fn submit<T: Transport, S: RowSource>(operation: &mut Operation<'_, T, Self>, stream: &mut Stream, rows: &mut RowReader<'_, S>, submitted: &mut usize) -> Result<Completion> { submit(operation, stream, rows, submitted).await }
-            async fn status<T: Transport>(operation: &mut Operation<'_, T, Self>) -> Result<PrinterState> {
+            async fn submit<T: Transport, S: RowSource, C: Clock>(operation: &mut Operation<'_, T, Self, C>, stream: &mut Stream, rows: &mut RowReader<'_, S>, submitted: &mut usize) -> Result<Completion> { submit(operation, stream, rows, submitted).await }
+            async fn status<T: Transport, C: Clock>(operation: &mut Operation<'_, T, Self, C>) -> Result<PrinterState> {
                 let command = Command::Query(Query::State).prepare(($spec).max_payload)?;
                 operation.status(&command).await
             }
-            async fn device_info<T: Transport>(operation: &mut Operation<'_, T, Self>) -> Result<DeviceInfo> {
+            async fn device_info<T: Transport, C: Clock>(operation: &mut Operation<'_, T, Self, C>) -> Result<DeviceInfo> {
                 let command = Command::Query(Query::DeviceInfo).prepare(($spec).max_payload)?;
                 device_info(&operation.exchange(&command, ReplyKind::Command(command.command), REPLY_TIMEOUT, &mut 0).await?.frame)
             }
@@ -988,6 +991,7 @@ impl Command<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloc::string::ToString;
     use std::io::Read;
 
     fn high_entropy_bytes(length: usize) -> Vec<u8> {

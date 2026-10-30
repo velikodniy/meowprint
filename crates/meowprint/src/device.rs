@@ -1,5 +1,8 @@
 //! Information returned by printer operations.
 
+use alloc::{string::String, vec::Vec};
+use core::fmt;
+
 /// Information reported by the printer firmware.
 ///
 /// Missing or uninterpretable fields are `None`. Other printer operations remain available.
@@ -56,8 +59,8 @@ impl PrinterState {
         }
     }
 }
-impl std::fmt::Display for PrinterState {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Display for PrinterState {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Ready => formatter.write_str("ready"),
             Self::Printing => formatter.write_str("already printing"),
@@ -74,8 +77,8 @@ impl std::fmt::Display for PrinterState {
         }
     }
 }
-impl std::fmt::Display for PrinterCondition {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Display for PrinterCondition {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(match self {
             Self::OutOfPaper => "out of paper",
             Self::CoverOpen => "cover open",

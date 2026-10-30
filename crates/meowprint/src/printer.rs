@@ -11,11 +11,13 @@
 //! Implement [`Transport`] only when your application needs a different connection
 //! backend or a simulated printer.
 
+#[cfg(feature = "tokio")]
+use crate::TokioClock;
 use crate::{
-    DeviceInfo, Driver, PixelFormat, PrinterState, Result,
+    Clock, DeviceInfo, Driver, PixelFormat, PrinterState, Result,
     session::{OperationKind, Session},
 };
-use tokio::sync::watch;
+use alloc::vec::Vec;
 
 /// The logical destination of bytes passed to [`Transport::write`].
 ///
@@ -43,95 +45,102 @@ pub enum TransportEvent {
     Disconnected,
 }
 
-/// The connection interface used by [`Printer`] to send and receive bytes.
-///
-/// For native Bluetooth, obtain a `BleTransport` through `Device::connect`.
-/// Implement this trait for another backend or for tests. Before constructing a
-/// printer, connect the backend and subscribe to the selected driver notification
-/// endpoint. [`Printer`] handles framing, write limits, pacing, and replies.
-///
-/// Implementations must preserve write order and report the selected connection
-/// events. A successful write means that the local backend accepted the bytes.
-/// It does not prove that the printer received or printed them.
-///
-/// [`Transport::event`] must be safe to cancel: dropping its future must not lose
-/// an event or prevent the next call from receiving it. [`Printer`] cancels event
-/// waits when a deadline expires. Writes also have time limits, and the library
-/// never retries a failed or timed-out write.
-///
-/// # Example
-///
-/// This in-memory transport records writes and sends no replies. A GT01 print
-/// finishes after its normal wait. Real transports must also report incoming events.
-#[doc = concat!(
-    "\n```no_run\n",
-    include_str!("../examples/custom_transport.rs"),
-    "\n```\n",
-)]
-pub trait Transport: Send {
-    /// Return the maximum byte count that one [`Self::write`] call accepts.
-    ///
-    /// The default is 20 bytes. Return a nonzero limit for the active connection.
-    /// [`Printer`] also enforces the selected driver limit.
-    fn max_write_size(&self) -> usize {
-        20
-    }
-    /// Submit bytes to the selected endpoint, in order.
-    ///
-    /// `bytes` contains one chunk, which can be only part of a protocol frame.
-    /// Do not add framing or retry after an uncertain result.
-    ///
-    /// # Errors
-    /// Return [`crate::Error::Transport`] on backend failure. Partial submission has an unknown outcome.
-    fn write(
-        &mut self,
-        channel: WriteChannel,
-        bytes: &[u8],
-    ) -> impl Future<Output = Result<()>> + Send;
-    /// Wait for one event from the selected notification endpoint or link.
-    ///
-    /// Preserve partial frames and unknown bytes. This method must be safe to
-    /// cancel and call again without losing an event.
-    ///
-    /// # Errors
-    /// Return [`crate::Error::Transport`] when the event stream fails.
-    fn event(&mut self) -> impl Future<Output = Result<TransportEvent>> + Send;
-    /// Close this connection.
-    ///
-    /// # Errors
-    /// Return [`crate::Error::Transport`] if the backend cannot close the link.
-    fn disconnect(&mut self) -> impl Future<Output = Result<()>> + Send;
-}
+macro_rules! declare_io_traits {
+    ($($send:ident)?) => {
+        /// The connection interface used by [`Printer`] to send and receive bytes.
+        ///
+        /// For native Bluetooth, obtain a `BleTransport` through `Device::connect`.
+        /// Connect and subscribe to the selected driver notification endpoint before
+        /// constructing a printer. [`Printer`] handles framing, limits, pacing, and replies.
+        ///
+        /// Preserve write order and report events for this connection. A successful
+        /// write means the local backend accepted bytes, not that paper was printed.
+        /// Event waits must be cancellation-safe: dropping a future must not lose
+        /// events or prevent subsequent calls. Writes have deadlines and are never retried.
+        ///
+        /// On browser and bare-metal targets, this trait and its futures can be local.
+        /// Other targets require `Send`.
+        #[cfg_attr(feature = "tokio", doc = concat!(
+            "\n# Example\n\n```no_run\n",
+            include_str!("../examples/custom_transport.rs"),
+            "\n```\n",
+        ))]
+        pub trait Transport $(: $send)? {
+            /// Return the maximum bytes accepted by one [`Self::write`] call.
+            ///
+            /// Return a nonzero connection limit. The default is 20 bytes;
+            /// [`Printer`] also enforces the selected driver limit.
+            fn max_write_size(&self) -> usize { 20 }
+            /// Submit one chunk to the selected endpoint, in order.
+            ///
+            /// A chunk can be part of a frame. Do not add framing or retry after
+            /// an uncertain result.
+            ///
+            /// # Errors
+            /// Return [`crate::Error::Transport`] on backend failure. Partial
+            /// submission has an unknown outcome.
+            fn write(&mut self, channel: WriteChannel, bytes: &[u8])
+                -> impl core::future::Future<Output = Result<()>> $(+ $send)?;
+            /// Wait for a notification or link event, preserving all bytes in order.
+            ///
+            /// This must be safe to cancel and call again without losing an event.
+            ///
+            /// # Errors
+            /// Return [`crate::Error::Transport`] if the event stream fails.
+            fn event(&mut self)
+                -> impl core::future::Future<Output = Result<TransportEvent>> $(+ $send)?;
+            /// Close this connection.
+            ///
+            /// # Errors
+            /// Return [`crate::Error::Transport`] if the backend cannot close the link.
+            fn disconnect(&mut self)
+                -> impl core::future::Future<Output = Result<()>> $(+ $send)?;
+        }
 
-/// A forward-only source of packed image rows.
-///
-/// Metadata must remain fixed during submission. Rows run top to bottom and use
-/// [`PixelFormat`]'s darkness polarity and bit/nibble order. Source methods must
-/// not perform printer I/O, and need not retain previously supplied rows.
-///
-/// A successful [`Printer::print`] requests exactly [`Self::height`] rows, with
-/// no EOF probe. Document framing, trailing data, and input deadlines belong to
-/// the source or its caller. Without a source deadline, a row can remain pending
-/// until cancellation or a printer fault. Abandoning printing may drop its future.
-pub trait RowSource: Send {
-    /// Return the fixed width in dots.
-    fn width(&self) -> u32;
-    /// Return the exact number of image rows to submit.
-    fn height(&self) -> u32;
-    /// Return the packed pixel format.
-    fn format(&self) -> PixelFormat;
-    /// Fill the entire destination with the next packed row.
-    ///
-    /// The destination contains width/8 bytes for Mono or width/2 for Gray4.
-    /// Printer notifications do not restart a pending row read.
-    /// Printer faults and invalid replies abort the operation.
-    ///
-    /// # Errors
-    /// Return an error if the requested row cannot be supplied. Destination
-    /// contents after an error are ignored; the connection is disabled even
-    /// when no print bytes have yet been sent. Earlier rows may already print.
-    fn read_row(&mut self, output: &mut [u8]) -> impl Future<Output = Result<()>> + Send;
+        /// A forward-only source of packed image rows.
+        ///
+        /// Metadata must remain fixed during submission. Rows run top to bottom
+        /// using [`PixelFormat`]'s darkness polarity and bit/nibble order. Methods
+        /// must not perform printer I/O and need not retain previous rows.
+        ///
+        /// Printing requests exactly the declared height, without an EOF probe.
+        /// Document framing, trailing input, and input deadlines belong to the source
+        /// or caller. A deadline-free row can wait until cancellation or printer fault.
+        /// Abandoning printing may drop its future.
+        ///
+        /// On browser and bare-metal targets, this trait and its futures can be local.
+        /// Other targets require `Send`.
+        pub trait RowSource $(: $send)? {
+            /// Return the fixed width in dots.
+            fn width(&self) -> u32;
+            /// Return the exact number of rows to submit.
+            fn height(&self) -> u32;
+            /// Return the packed pixel format.
+            fn format(&self) -> PixelFormat;
+            /// Fill the entire destination with the next packed row.
+            ///
+            /// The destination contains width/8 bytes for Mono or width/2 for Gray4.
+            /// Notifications do not restart a pending read. Printer faults and
+            /// invalid replies abort the operation.
+            ///
+            /// # Errors
+            /// Return an error if a row cannot be supplied. Its contents are ignored
+            /// after errors, and the connection is disabled even before any write.
+            /// Earlier rows may already print.
+            fn read_row(&mut self, output: &mut [u8])
+                -> impl core::future::Future<Output = Result<()>> $(+ $send)?;
+        }
+    };
 }
+#[cfg(not(any(target_family = "wasm", target_os = "none")))]
+declare_io_traits!(Send);
+#[cfg(any(target_family = "wasm", target_os = "none"))]
+declare_io_traits!();
+
+#[cfg(target_has_atomic = "ptr")]
+use cancellation_atomic as cancellation_backend;
+#[cfg(not(target_has_atomic = "ptr"))]
+use cancellation_local as cancellation_backend;
 
 /// A shared handle that requests cancellation of a [`Printer`] operation.
 ///
@@ -145,36 +154,329 @@ pub trait RowSource: Send {
 /// Cancellation permanently disables the connection, even when it is idle.
 /// If the printer is idle, call [`Printer::disconnect`] after requesting cancellation.
 /// The request cannot be reset, and previously submitted rows can still print.
-#[derive(Debug, Clone)]
+///
+/// On targets without pointer atomics, the handle is local to its executor and must
+/// not be transferred across threads or interrupts.
+#[derive(Clone)]
 pub struct Cancellation {
-    sender: watch::Sender<bool>,
+    state: cancellation_backend::State,
 }
+
+impl core::fmt::Debug for Cancellation {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("Cancellation")
+            .field("cancelled", &self.is_cancelled())
+            .finish()
+    }
+}
+
 impl Cancellation {
     pub(crate) fn new() -> Self {
         Self {
-            sender: watch::channel(false).0,
+            state: cancellation_backend::State::new(),
         }
     }
-}
-impl Cancellation {
+
     /// Request that this connection stop its active operation.
     ///
     /// Keep awaiting the active operation until it returns and completes its
     /// cleanup attempt. If the printer is idle, call [`Printer::disconnect`].
     pub fn cancel(&self) {
-        self.sender.send_replace(true);
+        self.state.cancel();
     }
+
     /// Return whether this handle received a cancellation request.
     ///
     /// `true` does not mean that the operation stopped or the connection closed.
     #[must_use]
     pub fn is_cancelled(&self) -> bool {
-        *self.sender.borrow()
+        self.state.is_cancelled()
     }
-    pub(crate) async fn cancelled(&self) {
-        let mut receiver = self.sender.subscribe();
-        if !*receiver.borrow_and_update() {
-            let _ = receiver.changed().await;
+
+    pub(crate) const fn cancelled(&self) -> cancellation_backend::Cancelled<'_> {
+        self.state.cancelled()
+    }
+}
+
+#[cfg(target_has_atomic = "ptr")]
+mod cancellation_atomic {
+    use alloc::sync::Arc;
+    use atomic_waker::AtomicWaker;
+    use core::{
+        future::Future,
+        pin::Pin,
+        sync::atomic::{AtomicBool, Ordering},
+        task::{Context, Poll},
+    };
+
+    #[derive(Clone)]
+    pub(super) struct State(Arc<Inner>);
+
+    struct Inner {
+        cancelled: AtomicBool,
+        waker: AtomicWaker,
+    }
+
+    impl State {
+        pub(super) fn new() -> Self {
+            Self(Arc::new(Inner {
+                cancelled: AtomicBool::new(false),
+                waker: AtomicWaker::new(),
+            }))
+        }
+
+        pub(super) fn cancel(&self) {
+            self.0.cancelled.store(true, Ordering::Release);
+            self.0.waker.wake();
+        }
+
+        pub(super) fn is_cancelled(&self) -> bool {
+            self.0.cancelled.load(Ordering::Acquire)
+        }
+
+        pub(super) const fn cancelled(&self) -> Cancelled<'_> {
+            Cancelled {
+                state: self,
+                done: false,
+            }
+        }
+    }
+
+    pub struct Cancelled<'a> {
+        state: &'a State,
+        done: bool,
+    }
+
+    impl Future for Cancelled<'_> {
+        type Output = ();
+
+        fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+            if self.state.is_cancelled() {
+                drop(self.state.0.waker.take());
+                self.done = true;
+                return Poll::Ready(());
+            }
+            self.state.0.waker.register(cx.waker());
+            if self.state.is_cancelled() {
+                drop(self.state.0.waker.take());
+                self.done = true;
+                Poll::Ready(())
+            } else {
+                Poll::Pending
+            }
+        }
+    }
+
+    impl Drop for Cancelled<'_> {
+        fn drop(&mut self) {
+            if !self.done {
+                drop(self.state.0.waker.take());
+            }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use alloc::{
+            sync::{Arc, Weak},
+            task::Wake,
+        };
+        use core::task::Waker;
+
+        #[derive(Default)]
+        struct CountWake(core::sync::atomic::AtomicUsize);
+
+        impl Wake for CountWake {
+            fn wake(self: Arc<Self>) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+            fn wake_by_ref(self: &Arc<Self>) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        #[test]
+        fn cancellation_registration_and_waiter_drop() {
+            let before = State::new();
+            before.cancel();
+            let noop = Waker::noop();
+            let mut cx = Context::from_waker(noop);
+            let mut ready = core::pin::pin!(before.cancelled());
+            assert!(ready.as_mut().poll(&mut cx).is_ready());
+
+            let state = State::new();
+            let wake = Arc::new(CountWake::default());
+            let weak: Weak<CountWake> = Arc::downgrade(&wake);
+            {
+                let waker = Waker::from(wake);
+                let mut cx = Context::from_waker(&waker);
+                let mut cancelled = core::pin::pin!(state.cancelled());
+                assert!(cancelled.as_mut().poll(&mut cx).is_pending());
+            }
+            assert!(weak.upgrade().is_none());
+
+            let wake = Arc::new(CountWake::default());
+            let waker = Waker::from(wake.clone());
+            let mut cx = Context::from_waker(&waker);
+            let mut cancelled = core::pin::pin!(state.cancelled());
+            assert!(cancelled.as_mut().poll(&mut cx).is_pending());
+            state.cancel();
+            state.cancel();
+            assert_eq!(wake.0.load(Ordering::SeqCst), 1);
+            assert!(cancelled.as_mut().poll(&mut cx).is_ready());
+            assert!(state.is_cancelled());
+            let mut already = core::pin::pin!(state.cancelled());
+            assert!(already.as_mut().poll(&mut cx).is_ready());
+        }
+
+        #[test]
+        fn public_cancellation_is_cross_thread() {
+            let cancellation = super::super::Cancellation::new();
+            let abandoned = cancellation.clone();
+            drop(abandoned);
+            assert!(!cancellation.is_cancelled());
+            let clone = cancellation.clone();
+            assert!(std::thread::spawn(move || clone.cancel()).join().is_ok());
+            assert!(cancellation.is_cancelled());
+        }
+    }
+}
+
+#[cfg(any(not(target_has_atomic = "ptr"), test))]
+mod cancellation_local {
+    use alloc::rc::Rc;
+    use core::{
+        cell::{Cell, RefCell},
+        future::Future,
+        pin::Pin,
+        task::{Context, Poll, Waker},
+    };
+
+    #[derive(Clone)]
+    pub(super) struct State(Rc<Inner>);
+
+    struct Inner {
+        cancelled: Cell<bool>,
+        waker: RefCell<Option<Waker>>,
+    }
+
+    impl State {
+        pub(super) fn new() -> Self {
+            Self(Rc::new(Inner {
+                cancelled: Cell::new(false),
+                waker: RefCell::new(None),
+            }))
+        }
+
+        pub(super) fn cancel(&self) {
+            self.0.cancelled.set(true);
+            let waker = self.0.waker.borrow_mut().take();
+            if let Some(waker) = waker {
+                waker.wake();
+            }
+        }
+
+        pub(super) fn is_cancelled(&self) -> bool {
+            self.0.cancelled.get()
+        }
+
+        pub(super) const fn cancelled(&self) -> Cancelled<'_> {
+            Cancelled {
+                state: self,
+                done: false,
+            }
+        }
+    }
+
+    pub struct Cancelled<'a> {
+        state: &'a State,
+        done: bool,
+    }
+
+    impl Future for Cancelled<'_> {
+        type Output = ();
+
+        fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+            if self.state.is_cancelled() {
+                drop(self.state.0.waker.borrow_mut().take());
+                self.done = true;
+                return Poll::Ready(());
+            }
+            *self.state.0.waker.borrow_mut() = Some(cx.waker().clone());
+            if self.state.is_cancelled() {
+                drop(self.state.0.waker.borrow_mut().take());
+                self.done = true;
+                Poll::Ready(())
+            } else {
+                Poll::Pending
+            }
+        }
+    }
+
+    impl Drop for Cancelled<'_> {
+        fn drop(&mut self) {
+            if !self.done {
+                drop(self.state.0.waker.borrow_mut().take());
+            }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use alloc::{
+            sync::{Arc, Weak},
+            task::Wake,
+        };
+        use core::task::Waker;
+
+        #[derive(Default)]
+        struct CountWake(core::sync::atomic::AtomicUsize);
+
+        impl Wake for CountWake {
+            fn wake(self: Arc<Self>) {
+                self.0.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
+            }
+            fn wake_by_ref(self: &Arc<Self>) {
+                self.0.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
+            }
+        }
+
+        #[test]
+        fn local_waker_lifecycle_and_sticky_cancellation() {
+            let before = State::new();
+            before.cancel();
+            let mut ready = core::pin::pin!(before.cancelled());
+            let noop = Waker::noop();
+            let mut cx = Context::from_waker(noop);
+            assert!(ready.as_mut().poll(&mut cx).is_ready());
+
+            let state = State::new();
+            let abandoned = state.clone();
+            drop(abandoned);
+            assert!(!state.is_cancelled());
+            let wake = Arc::new(CountWake::default());
+            let weak: Weak<CountWake> = Arc::downgrade(&wake);
+            {
+                let waker = Waker::from(wake);
+                let mut cx = Context::from_waker(&waker);
+                let mut cancelled = core::pin::pin!(state.cancelled());
+                assert!(cancelled.as_mut().poll(&mut cx).is_pending());
+            }
+            assert!(weak.upgrade().is_none());
+            let wake = Arc::new(CountWake::default());
+            let waker = Waker::from(wake.clone());
+            let mut cx = Context::from_waker(&waker);
+            let mut cancelled = core::pin::pin!(state.cancelled());
+            assert!(cancelled.as_mut().poll(&mut cx).is_pending());
+            state.cancel();
+            state.cancel();
+            assert_eq!(wake.0.load(core::sync::atomic::Ordering::SeqCst), 1);
+            assert!(cancelled.as_mut().poll(&mut cx).is_ready());
+            assert!(state.is_cancelled());
+            let mut already = core::pin::pin!(state.cancelled());
+            assert!(already.as_mut().poll(&mut cx).is_ready());
         }
     }
 }
@@ -218,9 +520,9 @@ pub struct PrintReport {
 
 /// A printer connection with a selected [`Driver`].
 ///
-/// For Bluetooth, use `Device::connect`. For a custom connection, pass a connected
-/// [`Transport`] to [`Self::new`]. Run prints, queries, and paper movement one at a time.
-/// All asynchronous operations require a Tokio runtime.
+/// For Bluetooth, use `Device::connect`. For custom connections, pass a connected
+/// [`Transport`] to [`Self::with_clock`]. Run one operation at a time.
+/// All asynchronous operations use the clock supplied at construction.
 ///
 /// [`Self::print`] borrows this printer, its row source, and its controls until
 /// printing completes. Pass `&Default::default()` for driver defaults.
@@ -234,22 +536,42 @@ pub struct PrintReport {
 /// Use [`Self::is_usable`] to decide whether to reconnect after an error.
 /// Status reads can report printer conditions without disabling the connection.
 /// Always await [`Self::disconnect`] when you finish, including after errors.
-pub struct Printer<T, D: Driver> {
+pub struct Printer<
+    T,
+    D: Driver,
+    #[cfg(feature = "tokio")] C: Clock = TokioClock,
+    #[cfg(not(feature = "tokio"))] C: Clock,
+> {
     pub(crate) session: Session<T>,
     pub(crate) driver: D,
+    pub(crate) clock: C,
 }
 
-impl<T: Transport, D: Driver> Printer<T, D> {
-    /// Create a printer from a transport and its matching driver.
+#[cfg(feature = "tokio")]
+impl<T: Transport, D: Driver> Printer<T, D, TokioClock> {
+    /// Create a printer from a transport and its matching driver using Tokio time.
     ///
     /// This constructor does not connect, subscribe, or send printer commands.
     /// For communication, connect and subscribe the transport first as described
     /// by [`Transport`]. Offline pixel conversion and preview use [`crate::Raster`].
     #[must_use]
     pub fn new(transport: T, driver: D) -> Self {
+        Self::with_clock(transport, driver, TokioClock::default())
+    }
+}
+
+impl<T: Transport, D: Driver, C: Clock> Printer<T, D, C> {
+    /// Create a printer using the supplied clock.
+    ///
+    /// This constructor does not connect, subscribe, or send printer commands.
+    /// For communication, connect and subscribe the transport first as described
+    /// by [`Transport`]. Offline pixel conversion and preview use [`crate::Raster`].
+    #[must_use]
+    pub fn with_clock(transport: T, driver: D, clock: C) -> Self {
         Self {
             session: Session::new(transport, driver.decoder()),
             driver,
+            clock,
         }
     }
 
@@ -308,7 +630,9 @@ impl<T: Transport, D: Driver> Printer<T, D> {
     pub async fn cancel(&mut self) -> Result<()> {
         self.session.ensure_usable()?;
         self.driver.validate_cancel()?;
-        let mut operation = self.session.begin(self.driver, OperationKind::Cancel)?;
+        let mut operation = self
+            .session
+            .begin(self.driver, OperationKind::Cancel, &self.clock)?;
         let result = operation.cancel().await;
         operation.finish(result).await
     }
@@ -322,7 +646,7 @@ impl<T: Transport, D: Driver> Printer<T, D> {
     /// Return transport or timeout errors. The connection remains unusable.
     /// After a successful close, later calls perform no transport I/O.
     pub async fn disconnect(&mut self) -> Result<()> {
-        self.session.disconnect().await
+        self.session.disconnect(&self.clock).await
     }
     /// Read the printer's state, including named conditions.
     ///
@@ -334,7 +658,9 @@ impl<T: Transport, D: Driver> Printer<T, D> {
     /// # Errors
     /// Communication failures, cancellation, and malformed replies disable the connection.
     pub async fn status(&mut self) -> Result<PrinterState> {
-        let mut operation = self.session.begin(self.driver, OperationKind::Observe)?;
+        let mut operation = self
+            .session
+            .begin(self.driver, OperationKind::Observe, &self.clock)?;
         let result = D::status(&mut operation).await;
         operation.finish(result).await
     }
@@ -347,14 +673,18 @@ impl<T: Transport, D: Driver> Printer<T, D> {
     /// A known pause returns [`crate::Error::PrinterUnavailable`] and leaves the connection usable.
     /// Communication failures, cancellation, and malformed replies disable the connection.
     pub async fn device_info(&mut self) -> Result<DeviceInfo> {
-        let mut operation = self.session.begin(self.driver, OperationKind::Observe)?;
+        let mut operation = self
+            .session
+            .begin(self.driver, OperationKind::Observe, &self.clock)?;
         let result = D::device_info(&mut operation).await;
         operation.finish(result).await
     }
     async fn move_paper(&mut self, rows: u16, retract: bool) -> Result<PrintReport> {
         self.session.ensure_usable()?;
         let movement = self.driver.movement(rows, retract)?;
-        let mut operation = self.session.begin(self.driver, OperationKind::Submit)?;
+        let mut operation = self
+            .session
+            .begin(self.driver, OperationKind::Submit, &self.clock)?;
         let result = async {
             let mut submitted = 0;
             operation.send_movement(&movement, &mut submitted).await?;

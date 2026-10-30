@@ -56,7 +56,8 @@
 //! Bluetooth access requires a powered adapter and host permission.
 //! On macOS, allow Bluetooth access for your application or terminal.
 //! On Linux, install the D-Bus development packages and `pkg-config` before building.
-//! Communication requires a Tokio runtime. Raster conversion and preview do not.
+//! Native Bluetooth uses Tokio. Custom transports can use their own [`Clock`]
+//! and executor. Raster conversion and preview need no runtime.
 //!
 //! # Supply image rows
 //!
@@ -85,7 +86,7 @@
 //!
 //! ```no_run
 //! # #[cfg(feature = "image")]
-//! # async fn example<T: meowprint::Transport, D: meowprint::Driver>(printer: &mut meowprint::Printer<T, D>, image: &image::DynamicImage) -> meowprint::Result<()> {
+//! # async fn example<T: meowprint::Transport, D: meowprint::Driver, C: meowprint::Clock>(printer: &mut meowprint::Printer<T, D, C>, image: &image::DynamicImage) -> meowprint::Result<()> {
 //! use meowprint::{Dither, ImageConversion, Position, Raster};
 //!
 //! let raster = Raster::from_image(
@@ -141,17 +142,29 @@
 //!
 //! # Custom connections
 //!
-//! Native Bluetooth support uses the default `bluetooth` feature.
-//! To supply another connection, implement [`Transport`] and pass it with a driver
-//! to [`Printer::new`]. Disable default features to exclude native Bluetooth dependencies:
+//! Native Bluetooth uses the default `bluetooth` feature and `Device::connect`.
+//! Custom connections implement [`Transport`] and select a constructor:
 //!
-//! ```toml
-//! meowprint = { version = "0.1", default-features = false }
-//! ```
+//! | Consumer | Features with defaults disabled | Constructor |
+//! | --- | --- | --- |
+//! | Native Tokio transport | `tokio` | `Printer::new(transport, driver)` |
+//! | Bare-metal or browser runtime | none | `Printer::with_clock(transport, driver, clock)` |
+//! | Custom runtime with image conversion | `image` | `Printer::with_clock(transport, driver, clock)` |
 //!
-//! Meowprint requires `std`; disabling default features removes native Bluetooth,
-//! not the standard library. Printer communication requires Tokio.
-//! The `image` feature works with or without `bluetooth`.
+//! With no features, the library supports full `no_std + alloc` streaming printing:
+//! transports, drivers, codecs, packed rasters, scanline dithering, and cancellation.
+//! The heap is always required; applications supply an allocator, executor, [`Clock`],
+//! and connected transport. No board HAL, BLE backend, or Web Bluetooth backend is
+//! supplied. `std` does not imply a runtime; `image` requires `std` but not Tokio.
+//!
+//! On browser and bare-metal targets, [`Transport`], [`RowSource`], and [`Clock`]
+//! may use local, non-`Send` futures. Native targets retain `Send` futures and
+//! `Send + Sync` clocks. Without pointer atomics, cancellation stays on one executor,
+//! not across threads or interrupts. Browser clocks must yield to browser tasks.
+//!
+//! Codec availability does not guarantee RAM fit: LZO's dictionary alone is about
+//! 455 KB. Raw Mono avoids that dictionary. Making this library `no_std` does not
+//! remove std, ESP-IDF, or allocations from firmware that still uses them.
 //! Custom BLE backends can use [`Driver::ble_profile`] without native Bluetooth.
 //! Before creating a printer, discover, validate, and subscribe to a compatible
 //! service as described by [`BleProfile`] and [`Transport`].
@@ -166,11 +179,17 @@
 ))]
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
+#![cfg_attr(not(feature = "std"), no_std)]
+
+extern crate alloc;
+#[cfg(all(test, not(feature = "std")))]
+extern crate std;
 
 #[cfg(feature = "bluetooth")]
 pub mod bluetooth;
 #[doc = include_str!("../docs/protocol.md")]
 pub mod protocol {}
+mod clock;
 mod device;
 mod dither;
 pub mod driver;
@@ -183,6 +202,9 @@ mod raster;
 mod session;
 mod stream;
 
+pub use clock::Clock;
+#[cfg(feature = "tokio")]
+pub use clock::TokioClock;
 pub use device::{DeviceInfo, PrinterCondition, PrinterState};
 pub use dither::{Dither, RowDither};
 pub use driver::*;

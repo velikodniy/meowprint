@@ -2,6 +2,8 @@
 //!
 //! Drivers supply frame headers, payload limits, and checksum requirements.
 //!
+use alloc::{vec, vec::Vec};
+
 use crate::{Result, error::invalid};
 
 /// Compute payload-only CRC-8 with polynomial `0x07` and initial value zero.
@@ -197,6 +199,7 @@ impl Decoder {
 #[cfg(test)]
 mod tests {
     use super::{Decoder, Frame, encode};
+    use alloc::vec;
 
     #[test]
     fn framing_preserves_fragmented_payloads_and_rejects_bad_crc() -> crate::Result<()> {

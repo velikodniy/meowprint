@@ -1,7 +1,7 @@
 //! Built-in printer drivers and their print controls.
 //!
 //! Pass a driver value such as [`Gt01`] or [`Mxw01::default()`] to
-//! `Device::connect` or [`Printer::new`](crate::Printer::new).
+//! `Device::connect` or [`Printer::with_clock`](crate::Printer::with_clock).
 //! Each driver has a matching options type, such as [`Gt01Options`].
 //! Choose a driver that matches your printer firmware. A Bluetooth name or
 //! service alone does not prove compatibility.
@@ -81,20 +81,22 @@ mod common;
 pub(crate) mod framing;
 mod mxw01;
 
+use alloc::vec::Vec;
+use alloc::{borrow::ToOwned, string::String};
+use core::{future::Future, time::Duration};
+
 use crate::{
-    Completion, DeviceInfo, PixelFormat, PrinterState, Raster, Result, RowSource, Transport,
+    Clock, Completion, DeviceInfo, PixelFormat, PrinterState, Raster, Result, RowSource, Transport,
     error::invalid,
 };
 use crate::{session::Operation, stream::RowReader};
-use framing::{Decoder, EncodedCommand, Frame};
-use std::time::Duration;
-
 pub use common::Mode as PrintMode;
 pub use common::{
     CommonRaw, CommonRawOptions, Gt01, Gt01Options, MonoEncoding, Mx10, Mx10Options, PrefixedTiny,
     PrefixedTinyOptions, TinyRle, TinyRleOptions, V5g, V5gEncoding, V5gOptions, X6h, X6hEncoding,
     X6hOptions,
 };
+use framing::{Decoder, EncodedCommand, Frame};
 pub use mxw01::{Mxw01, Mxw01Options, ReplyFormat as Mxw01ReplyFormat};
 
 /// Compression for packed raster rows.
@@ -246,52 +248,61 @@ pub(crate) enum Movement {
     Commands(Vec<EncodedCommand>),
     BlankRows { frame: Vec<u8>, count: u16 },
 }
-/// Driver-specific submission, queries, and reply handling.
-pub(crate) trait Operations: Sized + Send + Sync {
-    type Stream: Send;
-    fn settings(&self) -> Settings;
-    fn decoder(&self) -> Decoder;
-    fn stream(
-        &self,
-        height: u32,
-        format: PixelFormat,
-        options: &<Self as Driver>::Options,
-    ) -> Result<Self::Stream>
-    where
-        Self: Driver;
-    fn submit<T: Transport, S: RowSource>(
-        operation: &mut Operation<'_, T, Self>,
-        stream: &mut Self::Stream,
-        rows: &mut RowReader<'_, S>,
-        submitted: &mut usize,
-    ) -> impl Future<Output = Result<Completion>> + Send
-    where
-        Self: Driver;
-    fn status<T: Transport>(
-        operation: &mut Operation<'_, T, Self>,
-    ) -> impl Future<Output = Result<PrinterState>> + Send
-    where
-        Self: Driver;
-    fn device_info<T: Transport>(
-        operation: &mut Operation<'_, T, Self>,
-    ) -> impl Future<Output = Result<DeviceInfo>> + Send
-    where
-        Self: Driver;
-    fn observe(&self, frame: &Frame) -> Result<Observation>;
-    fn blocks_submission(&self, _frame: &Frame, state: &PrinterState) -> bool {
-        state.blocks_submission()
-    }
-    fn movement(&self, _rows: u16, _retract: bool) -> Result<Movement> {
-        Err(invalid(
-            "This driver does not support standalone paper movement.",
-        ))
-    }
-    fn cancel_command(&self) -> Result<Option<EncodedCommand>> {
-        Ok(None)
-    }
+macro_rules! declare_operations {
+    ([$($future_bounds:tt)*]) => {
+        /// Driver-specific submission, queries, and reply handling.
+        pub(crate) trait Operations: Sized + Send + Sync {
+            type Stream: Send;
+            fn settings(&self) -> Settings;
+            fn decoder(&self) -> Decoder;
+            fn stream(
+                &self,
+                height: u32,
+                format: PixelFormat,
+                options: &<Self as Driver>::Options,
+            ) -> Result<Self::Stream>
+            where
+                Self: Driver;
+            fn submit<T: Transport, S: RowSource, C: Clock>(
+                operation: &mut Operation<'_, T, Self, C>,
+                stream: &mut Self::Stream,
+                rows: &mut RowReader<'_, S>,
+                submitted: &mut usize,
+            ) -> impl Future<Output = Result<Completion>> $($future_bounds)*
+            where
+                Self: Driver;
+            fn status<T: Transport, C: Clock>(
+                operation: &mut Operation<'_, T, Self, C>,
+            ) -> impl Future<Output = Result<PrinterState>> $($future_bounds)*
+            where
+                Self: Driver;
+            fn device_info<T: Transport, C: Clock>(
+                operation: &mut Operation<'_, T, Self, C>,
+            ) -> impl Future<Output = Result<DeviceInfo>> $($future_bounds)*
+            where
+                Self: Driver;
+            fn observe(&self, frame: &Frame) -> Result<Observation>;
+            fn blocks_submission(&self, _frame: &Frame, state: &PrinterState) -> bool {
+                state.blocks_submission()
+            }
+            fn movement(&self, _rows: u16, _retract: bool) -> Result<Movement> {
+                Err(invalid(
+                    "This driver does not support standalone paper movement.",
+                ))
+            }
+            fn cancel_command(&self) -> Result<Option<EncodedCommand>> {
+                Ok(None)
+            }
+        }
+    };
 }
 
+#[cfg(not(any(target_family = "wasm", target_os = "none")))]
+declare_operations!([+ Send]);
+#[cfg(any(target_family = "wasm", target_os = "none"))]
+declare_operations!([]);
+
 fn readable_text(data: &[u8]) -> Option<String> {
-    let text = std::str::from_utf8(data).ok()?.trim_end_matches('\0');
+    let text = core::str::from_utf8(data).ok()?.trim_end_matches('\0');
     (!text.is_empty() && !text.chars().any(char::is_control)).then(|| text.to_owned())
 }
